@@ -1,0 +1,15 @@
+version: "3.8"
+name: lextorah_ai
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    networks:
+      - lextorah_network
+    env_file:
+      - .env
+    volumes:
+      - ./materials:/app/materials
+      - ./uploads:/app/uploads
+    restart: unless-stopped
