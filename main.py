@@ -940,9 +940,11 @@ async def get_live_classes(course: str = None, level: str = None):
     query = {}
     if course: query["course"] = {"$regex": f"^{course}$", "$options": "i"}
     if level: query["level"] = {"$regex": f"^{level}$", "$options": "i"}
+    print("Live Class Update Data: ", live_classes_collection)
     
     cursor = live_classes_collection.find(query).sort("date", 1)
     classes = await cursor.to_list(length=100)
+    print("Live Classes: ", classes)
     
     for c in classes:
         c["id"] = str(c["_id"])

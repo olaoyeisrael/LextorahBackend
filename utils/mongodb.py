@@ -7,7 +7,7 @@ load_dotenv()
 
 MONGO_URI = os.getenv("MONGO_URI")
 client = AsyncIOMotorClient(MONGO_URI)
-db = client["lextorahmaterials"]
+db = client["lextorah_materials"]
 course_collection = db["courses"]
 user_collection = db["users"]
 data_collection = db["data"]
