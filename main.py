@@ -754,9 +754,37 @@ async def get_curriculum_list(course: str = Query(None), level: str = Query(None
 
     items = await cursor.to_list(length=1000)
     
+    # --- FETCH MATERIALS TO CHECK STATUS ---
+    from utils.mongodb import course_collection
+    
+    # Build a query for materials that match the requested course/level
+    mat_query = {}
+    if course: mat_query["course_title"] = {"$regex": f"^{course}$", "$options": "i"}
+    if level: mat_query["level"] = {"$regex": f"^{level}$", "$options": "i"}
+    
+    materials_cursor = course_collection.find(mat_query)
+    materials = await materials_cursor.to_list(length=1000)
+    
+    # Map topic -> material_filename (normalize topic for matching)
+    # Using a dictionary where key is lowercase topic
+    topic_material_map = {}
+    for mat in materials:
+        t = mat.get("topic", "").strip().lower()
+        if t:
+            topic_material_map[t] = mat.get("filename")
+
     for i in items:
         i["id"] = str(i["_id"])
         del i["_id"]
+        
+        # Check if material exists for this topic
+        curr_topic = i.get("topic", "").strip().lower()
+        if curr_topic in topic_material_map:
+            i["material_filename"] = topic_material_map[curr_topic]
+        else:
+            i["material_filename"] = None
+
+    print("Curriculum Items with Material Status: ", items)
         
     return {"curriculum": items}
 
