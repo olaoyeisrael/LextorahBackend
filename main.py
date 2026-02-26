@@ -14,9 +14,11 @@ from services.chat import chat_with_model
 # from services.teaching import stream_teach
 from fastapi.responses import StreamingResponse
 
+import json
+import requests
 import asyncio
 # from services.teach import generate_lesson_stream
-from utils.mongodb import user_collection
+from utils.mongodb import user_collection, course_collection
 from services.quiz import generate_quiz
 # from services.transcription import transcribe_audio
 import shutil
@@ -30,6 +32,11 @@ import io
 from PyPDF2 import PdfReader
 from openai import OpenAI
 from dotenv import load_dotenv
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
+
+
 
 load_dotenv()
 
@@ -47,6 +54,7 @@ origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "http://localhost:8000",
+    "http://localhost:5173",
     "*"
 ]
 
@@ -57,6 +65,174 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+class ClassroomSession:
+    def __init__(self, material_text: str):
+        splitter = RecursiveCharacterTextSplitter(chunk_size=100, chunk_overlap=10)
+        self.chunks = splitter.split_text(material_text)
+        self.current_index = 0
+sessions = {}
+
+# --- Pydantic Models ---
+class MaterialUpload(BaseModel):
+    session_id: str
+    content: str
+
+# --- Endpoints ---
+
+# @app.post("/classroom/initialize")
+# async def initialize_classroom(upload: MaterialUpload):
+#     """Initializes a classroom session with the provided material."""
+#     sessions[upload.session_id] = ClassroomSession(upload.content)
+#     return {"message": "Classroom ready", "total_chunks": len(sessions[upload.session_id].chunks)}
+
+# @app.get("/classroom/{session_id}/next")
+# async def stream_next_chunk(session_id: str):
+#     """Retrieves the next chunk and streams an AI explanation."""
+#     if session_id not in sessions:
+#         raise HTTPException(status_code=404, detail="Session not found")
+    
+#     session = sessions[session_id]
+#     if session.current_index >= len(session.chunks):
+#         return {"message": "End of material reached"}
+
+#     chunk_to_explain = session.chunks[session.current_index]
+#     session.current_index += 1
+
+#     async def generate_explanation():
+#         llm = ChatOpenAI(model="gpt-4", streaming=True, api_key=os.getenv('OPEN_AI_KEY'))
+        
+#         # Crafting the "Teacher" persona
+#         messages = [
+#             SystemMessage(content="""You are a helpful classroom tutor. 
+#             Explain the following technical material simply. 
+#             Highlight key terms and ask one check-in question at the end."""),
+#             HumanMessage(content=f"Here is the lesson material: {chunk_to_explain}")
+#         ]
+
+#         # Streaming the response word by word
+#         async for chunk in llm.astream(messages):
+#             yield f"data: {chunk.content}\n\n"
+#         yield "data: [DONE]\n\n"
+
+#     return StreamingResponse(generate_explanation(), media_type="text/event-stream")
+
+
+# db = client["lextorah"]
+
+# --- Helper: Extract and Chunk ---
+def get_sections_for_user(user, mat):
+    # Logic from your WS: Download PDF if URL, or load local
+    raw_sections = []
+    c_url = mat.get("cloud_url")
+    if c_url:
+        r = requests.get(c_url)
+        pdf_stream = io.BytesIO(r.content)
+        raw_sections = extract_text_from_file(pdf_stream)
+    else:
+        file_path = mat.get("file")
+        if file_path:
+            if not file_path.startswith("materials/"):
+                file_path = os.path.join("materials", os.path.basename(file_path))
+            raw_sections = extract_text_from_file(file_path)
+            
+    if not raw_sections:
+        return []
+        
+    full_text = "\n\n".join([s["content"] for s in raw_sections])
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    chunks = splitter.split_text(full_text)
+    
+    return [{"title": f"Part {i+1}", "content": chunk} for i, chunk in enumerate(chunks)]
+
+@app.get("/classroom/next/{user_id}")
+async def stream_classroom_section(user_id: str, topic: str, section: int = None):
+    # 1. Fetch User and Material (Your existing MongoDB logic)
+    user = await get_user(user_id)
+    curr_course = user.get("enrolled_course", "German")
+    curr_level = user.get("enrolled_level", "A1")
+    
+    mat = await course_collection.find_one({
+        "topic": {"$regex": f"^{topic}$", "$options": "i"},
+        "course_title": {"$regex": f"^{curr_course}$", "$options": "i"},
+        "level": {"$regex": f"^{curr_level}$", "$options": "i"}
+    })
+    
+    if not mat:
+        raise HTTPException(status_code=404, detail="Material not found")
+
+    # 2. Extract Sections (PDF to Text)
+    sections = get_sections_for_user(user, mat)
+
+    idx = int(user.get("current_section", 1))
+    last_topic = user.get("classroom_topic")
+    
+    should_update_db = False
+
+    if section is not None:
+        # User explicitly requested a jump
+        idx = section
+        should_update_db = True
+    elif last_topic != topic:
+        # User started a new topic naturally
+        idx = 1
+        should_update_db = True
+
+    if should_update_db:
+        await user_collection.update_one(
+            {"_id": user_id},
+            {"$set": {"classroom_topic": topic, "current_section": idx}}
+        )
+    
+    print(f"DEBUG: topic={topic}, user current_section={idx}, len(sections)={len(sections)}, requested_section={section}")
+
+    # 3. Check if Lesson is Finished -> Trigger Quiz
+    if idx > len(sections):
+        async def trigger_quiz():
+            # Combine all content to generate quiz (like your WS logic)
+            full_content = "\n\n".join([s["content"] for s in sections])
+            quiz_data = await asyncio.to_thread(generate_quiz, full_content)
+            yield f"data: {json.dumps({'type': 'quiz', 'data': quiz_data})}\n\n"
+        
+        return StreamingResponse(trigger_quiz(), media_type="text/event-stream")
+
+    # 4. Get Current Section
+    section = sections[idx - 1]
+    
+    # 5. Increment progress in DB for the next call
+    await user_collection.update_one(
+        {"_id": user_id},
+        {"$set": {"current_section": idx + 1}}
+    )
+
+    # 6. Stream the Explanation (English translations included)
+    async def generate_explanation():
+        # First yield the metadata needed for Learn.jsx navigation UI
+        syllabus_data = [{"title": s["title"], "index": i + 1} for i, s in enumerate(sections)]
+        yield f"data: {json.dumps({'type': 'syllabus', 'sections': syllabus_data})}\n\n"
+        yield f"data: {json.dumps({'type': 'info', 'section_index': idx})}\n\n"
+        
+        llm = ChatOpenAI(model="gpt-4", streaming=True, api_key=os.getenv('OPEN_AI_KEY'))
+        messages = [
+            SystemMessage(content="""You are a bilingual tutor. 
+            If the material is not English, explain it in English terms.
+            Teach clearly and end with a check-in question."""),
+            HumanMessage(content=f"Explain this: {section['content']}")
+        ]
+        
+        async for chunk in llm.astream(messages):
+            yield f"data: {json.dumps({'type': 'explanation', 'text': chunk.content})}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(generate_explanation(), media_type="text/event-stream")
+
+
+
+
+
+
+
+
 
 
 @app.websocket("/ws/teach/{userid}")
@@ -597,6 +773,7 @@ async def decode_token_endpoint(token: str = Query(..., alias="token")):
         {"$set": update_data},
         upsert=True
     )
+    print("decoded token:", decodedToken)
     
     return {"decoded": decodedToken}
 
