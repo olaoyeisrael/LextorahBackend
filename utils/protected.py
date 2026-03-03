@@ -36,9 +36,12 @@ def decode_token(token: str = Depends(get_token_from_header)):
             algorithms=["HS256"],
             options={"verify_aud": False, "verify_iss": False, "verify_nbf": False}
         )
+        print("Decoded JWT Payload: ", payload)
         student_id = payload.get("student_id")
         if student_id and str(student_id).lower() == "admin":
             role = "admin"
+        elif student_id and str(student_id).lower().startswith("tutor"):
+            role = "tutor"
         else:
             role = "student"
             

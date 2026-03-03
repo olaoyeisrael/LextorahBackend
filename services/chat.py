@@ -8,6 +8,8 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 from services.uploadMaterial import retrieve_context
 from utils.helper import get_user
 from utils.mongodb import user_collection
+from langchain.agents import create_agent
+from langgraph.checkpoint.memory import MemorySaver
 
 load_dotenv()
 
@@ -162,33 +164,29 @@ def get_in_memory_history(session_id: str) -> ChatMessageHistory:
 
 from duckduckgo_search import DDGS
 
-def search_lextorah(query: str):
+from langchain_core.tools import tool
+
+@tool
+def search_lextorah_elearning(query: str) -> str:
+    """Search the lextorah-elearning.com website for answers to customer support queries."""
     try:
-        results = DDGS().text(f"site:lextorah.com {query}", max_results=3)
-        return [f"Title: {r['title']}\nSnippet: {r['body']}\nLink: {r['href']}" for r in results]
+        results = DDGS().text(f"site:lextorah-elearning.com {query}", max_results=3)
+        return "\n\n".join([f"Title: {r['title']}\nSnippet: {r['body']}\nLink: {r['href']}" for r in results])
     except Exception as e:
         print(f"Search error: {e}")
-        return []
+        return "No relevant information found."
+
+
+
+support_tools = [search_lextorah_elearning]
+support_agent = create_agent(model=llm, tools = support_tools, system_prompt=("You are Ms Lexi, a helpful customer support agent for Lextorah. Use the search_lextorah_elearning tool to search https://www.lextorah-elearning.com/ for information to answer the user's question. Be polite, concise, and helpful."), checkpointer=MemorySaver())
+
 
 async def chat_support(session_id: str, question: str):
-    # Retrieve context to help answer questions about the platform
-    # Combine vector store context with live web search
-    web_context = search_lextorah(question)
-    
-    combined_context = web_context
-    context_text = "\n\n".join(combined_context) if combined_context else "No relevant context found."
+    response = support_agent.invoke(
+            {"messages": [{"role": "user", "content": question}]},
+            config={"configurable": {"thread_id": session_id}}
+        )
 
-    chat_with_history = RunnableWithMessageHistory(
-        chain,
-        lambda session_id: get_in_memory_history(session_id),
-        input_messages_key="question",
-        history_messages_key="history_messages"
-        
-    )
-
-    msg = await chat_with_history.ainvoke(
-        {"question": question, "context": context_text},
-        {"configurable": {"session_id": session_id}}
-    )
-    return msg
-
+    final_response = response.get("messages")[-1].content if response.get("messages") else "Sorry, I couldn't find an answer to your question."
+    return final_response
