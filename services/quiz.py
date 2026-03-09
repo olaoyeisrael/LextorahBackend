@@ -50,7 +50,7 @@ client = OpenAI(api_key=os.getenv("OPEN_AI_KEY"))
 
 import asyncio
 
-def generate_quiz(material: str = None, topic: str = None, subject: str = "General", difficulty: str = "Medium", num_questions: int = 5):
+def generate_quiz(material: str = None, topic: str = None, subject: str = "General", difficulty: str = "Medium", num_questions: int = 12):
     if material:
         print("Material: ", material)
         prompt = QUIZ_PROMPT_MATERIAL.format(content=material, difficulty=difficulty, num_questions=num_questions)

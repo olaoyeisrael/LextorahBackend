@@ -18,7 +18,8 @@ import json
 import requests
 import asyncio
 # from services.teach import generate_lesson_stream
-from utils.mongodb import user_collection, course_collection
+from utils.mongodb import user_collection, course_collection, sprints_collection
+from services.classroom_agent import classroom_app
 from services.quiz import generate_quiz
 # from services.transcription import transcribe_audio
 import shutil
@@ -144,25 +145,54 @@ def get_sections_for_user(user, mat):
     chunks = splitter.split_text(full_text)
     
     return [{"title": f"Part {i+1}", "content": chunk} for i, chunk in enumerate(chunks)]
-
 @app.get("/classroom/next/{user_id}")
-async def stream_classroom_section(user_id: str, topic: str, section: int = None):
-    # 1. Fetch User and Material (Your existing MongoDB logic)
+async def stream_classroom_section(user_id: str, topic: str, sprint_id: int = None, section: int = None):
+    # 1. Fetch User and Determine Sprint Topic
     user = await get_user(user_id)
-    curr_course = user.get("enrolled_course", "German")
-    curr_level = user.get("enrolled_level", "A1")
     
-    mat = await course_collection.find_one({
-        "topic": {"$regex": f"^{topic}$", "$options": "i"},
-        "course_title": {"$regex": f"^{curr_course}$", "$options": "i"},
-        "level": {"$regex": f"^{curr_level}$", "$options": "i"}
-    })
-    
-    if not mat:
-        raise HTTPException(status_code=404, detail="Material not found")
+    sprint_course_code = None
+    # Optional logic: If a topic wasn't provided, try resolving from sprint directly
+    resolved_topic = topic
+    if sprint_id:
+        from utils.mongodb import sprints_collection
+        sprint = await sprints_collection.find_one({"id": sprint_id})
+        if sprint:
+            sprint_course_code = sprint.get("course_code")
+            if not resolved_topic and "curriculum" in sprint and len(sprint["curriculum"]) > 0:
+                resolved_topic = sprint["curriculum"][0].get("topic")
+            
+    import re
 
-    # 2. Extract Sections (PDF to Text)
-    sections = get_sections_for_user(user, mat)
+    # 2. Extract Sections for ALL topics in the string (comma-separated if array)
+    topics_list = [t.strip() for t in resolved_topic.split(',') if t.strip()]
+    
+    sections = []
+    for single_topic in topics_list:
+        safe_topic = re.escape(single_topic) # Escape "()", "+", etc. so $regex works purely as a string match
+        
+        # Create lookup for this specific topic
+        mat_query = {
+            "topic": {"$regex": f"^{safe_topic}$", "$options": "i"}
+        }
+        
+        # Optionally bind to their enrolled course/level to prevent pulling the wrong PDF 
+        # (Using a very loose contains search because enrolled_course might be "German" while course_title in DB is "FRE/A1/WD/177")
+        if user.get("enrolled_level"):
+            mat_query["level"] = {"$regex": f"^{user['enrolled_level']}$", "$options": "i"}
+        
+        print(f"DEBUG DB QUERY: {mat_query}")
+            
+        mat_cursor = course_collection.find(mat_query)
+        mats = await mat_cursor.to_list(length=1)
+        if mats:
+            # Extract and immediately append to our master sections list
+            mat_sections = get_sections_for_user(user, mats[0])
+            sections.extend(mat_sections)
+
+    if not sections:
+        raise HTTPException(status_code=404, detail=f"No material found for topics: {resolved_topic}")
+
+    topic = resolved_topic
 
     idx = int(user.get("current_section", 1))
     last_topic = user.get("classroom_topic")
@@ -205,23 +235,51 @@ async def stream_classroom_section(user_id: str, topic: str, section: int = None
         {"$set": {"current_section": idx + 1}}
     )
 
-    # 6. Stream the Explanation (English translations included)
+    # 6. Stream the Explanation Using LangGraph Agent
     async def generate_explanation():
         # First yield the metadata needed for Learn.jsx navigation UI
         syllabus_data = [{"title": s["title"], "index": i + 1} for i, s in enumerate(sections)]
         yield f"data: {json.dumps({'type': 'syllabus', 'sections': syllabus_data})}\n\n"
         yield f"data: {json.dumps({'type': 'info', 'section_index': idx})}\n\n"
         
-        llm = ChatOpenAI(model="gpt-4", streaming=True, api_key=os.getenv('OPEN_AI_KEY'))
-        messages = [
-            SystemMessage(content="""You are a bilingual tutor. 
-            If the material is not English, explain it in English terms.
-            Teach clearly and end with a check-in question."""),
-            HumanMessage(content=f"Explain this: {section['content']}")
-        ]
+        # Stream from LangGraph node natively
+        full_explanation_text = ""
+        async for msg, metadata in classroom_app.astream({"section_content": section['content']}, stream_mode="messages"):
+            # Ensure we only stream content text chunks
+            if msg.content:
+                # Sometimes msg.content can be an array if using complex model calls, wrap check
+                content_to_yield = msg.content if isinstance(msg.content, str) else str(msg.content)
+                full_explanation_text += content_to_yield
+                yield f"data: {json.dumps({'type': 'explanation', 'text': content_to_yield})}\n\n"
+                
+        # ---> Auto Save Transcript <---
+        from utils.mongodb import db
+        existing_transcript = await db.transcripts.find_one({
+            "user_id": user_id, 
+            "topic": topic,
+            "course": user.get('enrolled_course', ''),
+            "level": user.get('enrolled_level', '')
+        })
         
-        async for chunk in llm.astream(messages):
-            yield f"data: {json.dumps({'type': 'explanation', 'text': chunk.content})}\n\n"
+        if full_explanation_text:
+            if not existing_transcript:
+                await db.transcripts.insert_one({
+                    "user_id": user_id,
+                    "topic": topic,
+                    "course": user.get('enrolled_course', ''),
+                    "level": user.get('enrolled_level', ''),
+                    "course_code": sprint_course_code,
+                    "content": full_explanation_text,
+                    "date": datetime.now()
+                })
+            else:
+                # Append the new section's explanation to the existing transcript
+                updated_content = existing_transcript.get("content", "") + "\n\n---\n\n" + full_explanation_text
+                await db.transcripts.update_one(
+                    {"_id": existing_transcript["_id"]},
+                    {"$set": {"content": updated_content, "date": datetime.now()}}
+                )
+
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate_explanation(), media_type="text/event-stream")
@@ -509,6 +567,8 @@ async def teach_ws(websocket: WebSocket, userid: str):
                  "user_id": user_id,
                  "file": filename,
                  "topic": safe, # Use safe filename as topic or extract title
+                 "course": user.get('enrolled_course', ''),
+                 "level": user.get('enrolled_level', ''),
                  "content": full_content,
                  "date": datetime.now()
              }
@@ -603,9 +663,64 @@ async def quiz_endpoint(body: QuizRequest):
         "Quiz": res
     }
 
+# --- CURRICULUM ENDPOINTS ---
+from utils.mongodb import sprints_collection, course_collection
+
+@app.get('/available_topics/{course_code:path}')
+async def get_available_topics(course_code: str):
+    """
+    Returns a distinct list of topic names available in the curriculum DB
+    for a given course code.
+    """
+    from utils.mongodb import curriculum_collection
+    # Find all curriculum items matching the course_code
+    cursor = curriculum_collection.find({"course_code": course_code})
     
+    # Extract unique topic titles
+    topics = set()
+    async for item in cursor:
+        if item.get("topic"):
+            topics.add(item.get("topic"))
+            
+    # Return as an ordered list
+    return {"topics": sorted(list(topics))}
 
+class SprintSyllabusTopic(BaseModel):
+    session_number: int
+    week: int
+    day: str
+    topic: list[str]
+    session_date: str
 
+class SprintSyllabusRequest(BaseModel):
+    sprint_id: str | int
+    course_code: str
+    syllabus: list[SprintSyllabusTopic]
+
+@app.get('/curriculum/sprint/{sprint_id}')
+async def get_sprint_curriculum(sprint_id: str):
+    """Fetches the existing syllabus specific to a sprint."""
+    doc = await sprints_collection.find_one({"sprint_id": str(sprint_id)})
+    if not doc:
+        return {"curriculum": []}
+    return {"curriculum": doc.get("syllabus", [])}
+
+@app.post('/curriculum/sprint/{sprint_id}')
+async def save_sprint_curriculum(sprint_id: str, body: SprintSyllabusRequest):
+    """Saves or overwrites the entire syllabus for a specific sprint."""
+    syllabus_data = [topic.dict() for topic in body.syllabus]
+    
+    await sprints_collection.update_one(
+        {"sprint_id": str(sprint_id)},
+        {"$set": {
+            "course_code": body.course_code,
+            "syllabus": syllabus_data,
+            "updated_at": datetime.now()
+        }},
+        upsert=True
+    )
+    
+    return {"message": "Syllabus saved successfully", "total_sessions": len(syllabus_data)}
 
 class QuestionRequest(BaseModel):
     question: str
@@ -853,15 +968,22 @@ class CurriculumItem(BaseModel):
     level: str
     week: int | None = None
     topic: str
+    course_code: str | None = None
     description: str | None = None
     index: int | None = None # Optional, auto-assigned if missing
+
+class CurriculumUpdateRequest(BaseModel):
+    course: str | None = None
+    level: str | None = None
+    week: int | None = None
+    topic: str | None = None
+    course_code: str | None = None
+    description: str | None = None
+    index: int | None = None
 
 
 @app.post('/curriculum')
 async def add_curriculum(item: CurriculumItem, user: UserOutput = Depends(decode_token)):
-    if user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admins only")
-        
     from utils.mongodb import curriculum_collection
     
     # Check if exists
@@ -884,9 +1006,6 @@ async def add_curriculum(item: CurriculumItem, user: UserOutput = Depends(decode
 
 @app.post('/curriculum/batch')
 async def add_curriculum_batch(items: list[CurriculumItem], user: UserOutput = Depends(decode_token)):
-    if user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admins only")
-        
     from utils.mongodb import curriculum_collection
     
     entries = []
@@ -917,6 +1036,37 @@ async def add_curriculum_batch(items: list[CurriculumItem], user: UserOutput = D
         await curriculum_collection.insert_one(entry)
     
     return {"msg": f"{len(items)} items added"}
+
+@app.put('/curriculum/{id}')
+async def update_curriculum(id: str, item: CurriculumUpdateRequest, user: UserOutput = Depends(decode_token)):
+    from utils.mongodb import curriculum_collection
+    from bson.objectid import ObjectId
+    
+    try:
+        obj_id = ObjectId(id)
+    except:
+        raise HTTPException(status_code=400, detail="Invalid curriculum ID")
+        
+    entry = item.dict(exclude_unset=True)
+    if not entry:
+        raise HTTPException(status_code=400, detail="No fields to update")
+        
+    if "course" in entry:
+        entry["course"] = entry["course"].lower()
+    if "level" in entry:
+        entry["level"] = entry["level"].lower()
+        
+    entry["updated_at"] = datetime.now()
+    
+    result = await curriculum_collection.update_one(
+        {"_id": obj_id},
+        {"$set": entry}
+    )
+    
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Curriculum item not found")
+        
+    return {"msg": "Curriculum updated successfully"}
 
 @app.get('/curriculum')
 
@@ -1003,26 +1153,40 @@ async def get_schedule(user: UserOutput = Depends(decode_token)):
 
 
 @app.get('/progress')
-async def get_progress(user: UserOutput = Depends(decode_token)):
-    # Calculate progress based on current_section / total_sections of the current file
-    # This is a bit tricky because 'file' in user model is the *current* file.
-    # If we want course progress, we need to know how many files/topics are in the course.
-    # For now, let's implement the specific request: "My courses should be the course and the progress in percentage... with the section the user is in and the total sections"
-    
-    # We will use the 'file' the user is currently on (or last worked on) to determine the "active" topic progress.
-    # For overall course progress, we'd need a syllabus.
-    
-    # Let's return the progress of the *current active topic* for now, effectively. 
-    # Or if we have the full schedule, we could calculate overall.
+async def get_progress(course_code: str, user: UserOutput = Depends(decode_token)):
+    from utils.mongodb import user_collection
+    from bson import ObjectId
     
     if not user.enrolled_level or not user.enrolled_course:
-         return {"progress": 0, "current_section": 0, "total_sections": 0, "course": "None"}
+         return {"progress": 0, "current_section": 0, "total_sections": 0, "course": "None", "completed_topics": []}
 
-    current_file = user.file
-    current_section = user.current_section or 1
+    completed_topics = []
+    
+    try:
+        from bson.errors import InvalidId
+        try:
+            user_id_query = ObjectId(user.id)
+        except InvalidId:
+            user_id_query = user.id
+            
+        # Fetch the real user document from DB to get the progress map
+        db_user = await user_collection.find_one({"_id": user_id_query})
+        print(db_user)
+        if db_user and "progress" in db_user:
+            course_progress = db_user["progress"].get(course_code, {})
+            completed_topics = course_progress.get("completed_topics", [])
+            print("Progress: ", course_progress)
+            print(course_code)
+    except Exception as e:
+        print(f"Error fetching user progress: {e}")
+
+    # Fallback to current file for rudimentary progress if needed
+    db_user = db_user or {}
+    current_file = db_user.get("file")
+    current_section = db_user.get("current_section", 1)
     
     if not current_file:
-         return {"progress": 0, "current_section": 0, "total_sections": 0, "course": f"{user.enrolled_course} {user.enrolled_level}"}
+         return {"progress": 0, "current_section": 0, "total_sections": 0, "course": f"{user.enrolled_course} {user.enrolled_level}", "completed_topics": completed_topics}
 
     # Get total sections for the file
     path = os.path.join("materials", os.path.normpath(current_file))
@@ -1033,13 +1197,15 @@ async def get_progress(user: UserOutput = Depends(decode_token)):
         total = 1 # avoid div by zero
 
     progress = int((current_section / total) * 100) if total > 0 else 0
+    print("Progress: ", progress)
     
     return {
         "course": f"{user.enrolled_course} {user.enrolled_level}",
         "current_topic": os.path.basename(current_file), # simple name
         "progress": progress,
         "current_section": current_section,
-        "total_sections": total
+        "total_sections": total,
+        "completed_topics": completed_topics
     }
 
 @app.get('/transcripts')
@@ -1072,12 +1238,18 @@ async def download_transcript(transcript_id: str):
     if not t:
         raise HTTPException(status_code=404, detail="Transcript not found")
         
-    pdf_bytes = create_pdf_from_text(t["content"], f"{t['topic']}.pdf")
+    raw_topic = t.get("topic", "Topic")
+    topic_str = ", ".join(raw_topic) if isinstance(raw_topic, list) else str(raw_topic)
+    clean_topic = topic_str.encode("ascii", "ignore").decode("ascii")
+    clean_topic = clean_topic.replace('"', '').replace("'", "").replace('/', '_')
+    
+    content_text = t.get("content", "")
+    pdf_bytes = create_pdf_from_text(content_text, f"{clean_topic}.pdf")
     
     return StreamingResponse(
         io.BytesIO(pdf_bytes), 
         media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename=transcript_{t['topic']}.pdf"}
+        headers={"Content-Disposition": f'attachment; filename="transcript_{clean_topic}.pdf"'}
     )
 
 from fastapi import Body
@@ -1275,6 +1447,70 @@ async def get_student_performance(user: UserOutput = Depends(decode_token)):
         
     return {"performance": results}
 
+import asyncio
+
+NOTIFICATION_EMAIL = "lextorah@gmail.com"
+
+def _format_dict_as_html(data: dict) -> str:
+    rows = "".join(
+        f"<tr><td style='padding:6px 12px;font-weight:bold;border:1px solid #e5e7eb;background:#f9fafb'>{k}</td>"
+        f"<td style='padding:6px 12px;border:1px solid #e5e7eb'>{v}</td></tr>"
+        for k, v in data.items() if k != "submitted_at"
+    )
+    return f"<table style='border-collapse:collapse;width:100%'>{rows}</table>"
+
+async def _send_email(subject: str, html_body: str):
+    try:
+        import resend
+        resend.api_key = os.getenv("RESEND_API_KEY")
+        
+
+        if not resend.api_key:
+            print("RESEND_API_KEY not set — skipping email")
+            return
+        await asyncio.to_thread(
+            resend.Emails.send,
+            {
+                "from": "Lextorah Notifications <onboarding@resend.dev>",
+                "to": [NOTIFICATION_EMAIL],
+                "subject": subject,
+                "html": html_body,
+            }
+        )
+        print(f"Notification email sent: {subject}")
+    except Exception as e:
+        print(f"Email send failed (non-fatal): {e}")
+
+@app.post('/contact')
+async def save_contact(data: dict):
+    """
+    Public endpoint — no auth required.
+    Saves Contact Us form submission to the contacts collection and emails admin.
+    """
+    from utils.mongodb import contacts_collection
+    data["submitted_at"] = datetime.now()
+    await contacts_collection.insert_one(data)
+    await _send_email(
+        subject=f"New Contact Us Message from {data.get('fullName', 'Unknown')}",
+        html_body=f"<h2>New Contact Us Submission</h2>{_format_dict_as_html(data)}"
+    )
+    return {"msg": "Thank you for reaching out! We will get back to you soon."}
+
+@app.post('/starterpack')
+async def save_starterpack(data: dict):
+    """
+    Public endpoint — no auth required.
+    Saves StarterPack form submission to the starterpack collection and emails admin.
+    """
+    from utils.mongodb import starterpack_collection
+    data["submitted_at"] = datetime.now()
+    await starterpack_collection.insert_one(data)
+    await _send_email(
+        subject=f"New Starter Pack Request from {data.get('institutionName', 'Unknown Institution')}",
+        html_body=f"<h2>New Starter Pack Request</h2>{_format_dict_as_html(data)}"
+    )
+    return {"msg": "Starter Pack request received. We will be in touch soon!"}
+
 @app.post('/save_quiz_result')
 async def save_quiz_result(result: dict, user: UserOutput = Depends(decode_token)):
     # { "score": 5, "total": 10, "course": "German", "topic": "Basics" }
@@ -1305,22 +1541,31 @@ async def complete_topic_endpoint(
     topic = body.get("topic")
     course = body.get("course")
     level = body.get("level")
+    course_code = body.get("course_code") # NEW
     material_content = body.get("material_content", "") # For transcript generation if needed
     
-    if not topic or not course or not level:
-        raise HTTPException(status_code=400, detail="Missing topic, course, or level")
+    if not topic or not course or not level or not course_code:
+        raise HTTPException(status_code=400, detail="Missing topic, course, level, or course_code")
 
-    course_key = f"{course}-{level}"
-   
-    user_progress =  {}
+    from utils.mongodb import user_collection
+    from bson import ObjectId
+    from bson.errors import InvalidId
+    
+    try:
+        user_id_query = ObjectId(user.id)
+    except InvalidId:
+        user_id_query = user.id
+        
+    db_user = await user_collection.find_one({"_id": user_id_query})
+    user_progress = db_user.get("progress", {}) if db_user else {}
     print("User progress (raw):", user_progress)
     
-    if course_key not in user_progress:
-        user_progress[course_key] = {"completed_topics": [], "current_topic": topic}
+    if course_code not in user_progress:
+        user_progress[course_code] = {"completed_topics": [], "current_topic": topic}
     
     # Mark complete
-    if topic not in user_progress[course_key]["completed_topics"]:
-        user_progress[course_key]["completed_topics"].append(topic)
+    if topic not in user_progress[course_code]["completed_topics"]:
+        user_progress[course_code]["completed_topics"].append(topic)
         
     # Calculate next topic
     # We need the full schedule to know what's next
@@ -1338,21 +1583,20 @@ async def complete_topic_endpoint(
     
     # Update current topic pointer
     if next_topic:
-        user_progress[course_key]["current_topic"] = next_topic
+        user_progress[course_code]["current_topic"] = next_topic
         # Also update legacy/root level field for backward compatibility
         # We need to calculate global index or just increment if consistent
         # user.current_topic_index = curr_idx + 1
     
     # Save Transcript (if material provided or simply acknowledge completion)
-    # The requirement: "save the material to the db to be generated as transcript"
-    if material_content:
+    content_to_save = material_content.strip() if material_content else ""
+    if content_to_save and content_to_save != "No content generated.":
         # Check if transcript already exists to avoid duplicates
         from utils.mongodb import db
         existing_transcript = await db.transcripts.find_one({
             "user_id": user.id, 
             "topic": topic,
-            "course": course,
-            "level": level
+            "course_code": course_code
         })
         
         if not existing_transcript:
@@ -1361,14 +1605,21 @@ async def complete_topic_endpoint(
                 "topic": topic,
                 "course": course,
                 "level": level,
-                "content": material_content,
+                "course_code": course_code,
+                "content": content_to_save,
                 "date": datetime.now()
             })
+        else:
+            # Update existing transcript content
+            await db.transcripts.update_one(
+                {"_id": existing_transcript["_id"]},
+                {"$set": {"content": content_to_save, "date": datetime.now()}}
+            )
 
     # DB Update
     # DB Update
     await user_collection.update_one(
-        {"_id": user.id}, 
+        {"_id": user_id_query}, 
         {
             "$set": {
                 "progress": user_progress, 
@@ -1388,6 +1639,7 @@ async def complete_topic_endpoint(
         "topic": topic,
         "course": course,
         "level": level,
+        "course_code": course_code,
         "date": datetime.now()
     })
 
@@ -1400,13 +1652,14 @@ async def complete_topic_endpoint(
             "type": "course_completion",
             "course": course,
             "level": level,
+            "course_code": course_code,
             "date": datetime.now()
          })
 
     return {
         "msg": "Topic completed", 
         "next_topic": next_topic,
-        "progress": user_progress[course_key],
+        "progress": user_progress[course_code],
         "course_finished": is_course_finished
     }
 
