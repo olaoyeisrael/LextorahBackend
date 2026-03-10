@@ -14,7 +14,7 @@ def TTS(input: str):
    
     with client.audio.speech.with_streaming_response.create(
         model="gpt-4o-mini-tts",
-        voice="shimmer",
+        voice="marin",
         input=input,
         instructions="Speak in a cheerful and positive tone.",
     ) as response:
@@ -24,3 +24,6 @@ def TTS(input: str):
 
 
 # ash
+
+# shimmer
+# coral

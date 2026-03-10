@@ -697,6 +697,44 @@ class SprintSyllabusRequest(BaseModel):
     course_code: str
     syllabus: list[SprintSyllabusTopic]
 
+@app.get('/curriculum/today/{user_id}')
+async def get_today_classes(user_id: str, sprint_ids: str = Query(None)):
+    """Returns only the syllabus topics scheduled for today across all of the user's sprints.
+    
+    sprint_ids: optional comma-separated list of sprint IDs (e.g. "1,2,5").
+    When provided, these are used directly instead of looking up the user's sprints
+    from the Python MongoDB, which may not have sprint membership data synced from Laravel.
+    """
+    user = await get_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_classes = []
+
+    # Prefer sprint_ids from query param (passed by frontend from Redux studentSprints),
+    # fall back to user document's "sprints" field for backward compatibility.
+    if sprint_ids:
+        ids_list = [sid.strip() for sid in sprint_ids.split(",") if sid.strip()]
+    else:
+        user_sprints = user.get("sprints", [])
+        ids_list = [str(sp.get("id", "")) for sp in user_sprints if sp.get("id")]
+
+    for sprint_id in ids_list:
+        doc = await sprints_collection.find_one({"sprint_id": sprint_id})
+        if not doc:
+            continue
+        for entry in doc.get("syllabus", []):
+            if entry.get("session_date") == today_str:
+                today_classes.append({
+                    **entry,
+                    "sprint_id": sprint_id,
+                    "sprint_name": doc.get("course_code", ""),
+                    "course_code": doc.get("course_code", ""),
+                })
+
+    return {"classes": today_classes}
+
 @app.get('/curriculum/sprint/{sprint_id}')
 async def get_sprint_curriculum(sprint_id: str):
     """Fetches the existing syllabus specific to a sprint."""
