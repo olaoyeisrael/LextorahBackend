@@ -1487,7 +1487,7 @@ async def get_student_performance(user: UserOutput = Depends(decode_token)):
 
 import asyncio
 
-NOTIFICATION_EMAIL = "lextorah@gmail.com"
+NOTIFICATION_EMAIL = "olaoyeaisrael@gmail.com"
 
 def _format_dict_as_html(data: dict) -> str:
     rows = "".join(
@@ -1497,25 +1497,28 @@ def _format_dict_as_html(data: dict) -> str:
     )
     return f"<table style='border-collapse:collapse;width:100%'>{rows}</table>"
 
-async def _send_email(subject: str, html_body: str):
+async def _send_email(subject: str, html_body: str, to_emails=None):
+    if to_emails is None:
+        to_emails = [NOTIFICATION_EMAIL]
+
     try:
         import resend
         resend.api_key = os.getenv("RESEND_API_KEY")
-        
 
         if not resend.api_key:
             print("RESEND_API_KEY not set — skipping email")
             return
+
         await asyncio.to_thread(
             resend.Emails.send,
             {
                 "from": "Lextorah Notifications <onboarding@resend.dev>",
-                "to": [NOTIFICATION_EMAIL],
+                "to": to_emails,
                 "subject": subject,
                 "html": html_body,
             }
         )
-        print(f"Notification email sent: {subject}")
+        print(f"Notification email sent: {subject} to {to_emails}")
     except Exception as e:
         print(f"Email send failed (non-fatal): {e}")
 
@@ -1538,16 +1541,39 @@ async def save_contact(data: dict):
 async def save_starterpack(data: dict):
     """
     Public endpoint — no auth required.
-    Saves StarterPack form submission to the starterpack collection and emails admin.
+    Saves StarterPack form submission to the starterpack collection and emails admin and optionally the requester.
     """
     from utils.mongodb import starterpack_collection
     data["submitted_at"] = datetime.now()
     await starterpack_collection.insert_one(data)
+
+    # Admin notification (always)
     await _send_email(
         subject=f"New Starter Pack Request from {data.get('institutionName', 'Unknown Institution')}",
         html_body=f"<h2>New Starter Pack Request</h2>{_format_dict_as_html(data)}"
     )
-    return {"msg": "Starter Pack request received. We will be in touch soon!"}
+
+    # User notification (when requester email is provided)
+    user_email = data.get("email")
+    drive_link = "https://drive.google.com/drive/u/0/folders/1Gu9BO2mxvamq1DDF9-53fTv44vVRG4dk"
+
+    if user_email:
+        user_html = "<h2>Starter Pack Access</h2>"
+        user_html += "<p>Thanks for requesting the Starter Pack.</p>"
+        user_html += f"<p>Your Starter Pack is available here: <a href=\"{drive_link}\" target=\"_blank\">Open Starter Pack</a></p>"
+
+        await _send_email(
+            subject="Your Starter Pack Access Link",
+            html_body=user_html,
+            to_emails=[user_email, NOTIFICATION_EMAIL]
+        )
+
+    return {"msg": "Starter Pack request received. We have sent the access link to your email!"}
+
+@app.post('/book-demo')
+async def book_demo():
+    pass
+
 
 @app.post('/save_quiz_result')
 async def save_quiz_result(result: dict, user: UserOutput = Depends(decode_token)):
