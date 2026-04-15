@@ -48,7 +48,12 @@ client = OpenAI(api_key=os.getenv('OPEN_AI_KEY'))
 
 
 
+from services.assignments import router as assignment_router
+from services.exam_prep import router as exam_prep_router
+
 app = FastAPI()
+app.include_router(assignment_router)
+app.include_router(exam_prep_router)
 
 origins = [
     "http://localhost",
@@ -824,7 +829,7 @@ async def askQuestion(chatid: str = Query(..., alias="chatid"), body: QuestionRe
     if not body or not body.question:
         raise HTTPException(status_code=400, detail="Missing question")
     
-    # ✅ Await async call
+    # Await async call
     # Use authenticated user.id instead of potentially invalid chatid
     res = await chat_with_model(user.id, body.question)
 
@@ -1937,3 +1942,15 @@ async def delete_curriculum_item(id: str, user: UserOutput = Depends(decode_toke
 
 
 
+# @app.post('/upload_materials')
+# async def upload_materials(id: str, user: UserOutput = Depends(decode_token)):
+#     pass
+
+
+# @app.get('/get_materials')
+# async def get_materials(id: str, user: UserOutput = Depends(decode_token)):
+#     pass
+
+# @app.post('/submit_assignment')
+# async def submit_assignment(id: str, user: UserOutput = Depends(decode_token)):
+#     pass
