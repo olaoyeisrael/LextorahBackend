@@ -280,19 +280,38 @@ async def submit_exam_results(body: ExamResultRequest):
         total = len(body.answers)
         score_percent = round((correct_count / total) * 100, 1) if total > 0 else 0
 
-        # Save to DB
+        # Look up student's name
+        from utils.mongodb import quiz_results_collection, user_collection
+        from bson.objectid import ObjectId
+        from bson.errors import InvalidId
+        
+        student_name = "Unknown"
+        try:
+            uid = ObjectId(body.student_id)
+        except InvalidId:
+            uid = body.student_id
+            
+        student_user = await user_collection.find_one({"_id": uid})
+        if student_user:
+             student_name = f"{student_user.get('first_name','')} {student_user.get('last_name','')}".strip()
+
+        # Save to Central DB (matching QuizResultDB schema)
         result_doc = {
-            "student_id": body.student_id,
+            "user_id": body.student_id,
+            "student_name": student_name,
+            "type": body.mode, # "practice" or "mock"
+            "course_title": student_user.get("enrolled_course", "General") if student_user else "General",
+            "level": student_user.get("enrolled_level", "") if student_user else "",
+            "topic": f"Exam Prep ({body.mode.capitalize()})",
             "course_code": body.course_code,
-            "mode": body.mode,
             "score": correct_count,
             "total": total,
             "score_percent": score_percent,
             "details": grading_results,
-            "submitted_at": datetime.now()
+            "date": datetime.now()
         }
 
-        inserted = await exam_results_collection.insert_one(result_doc)
+        inserted = await quiz_results_collection.insert_one(result_doc)
 
         return {
             "message": "Exam graded successfully",

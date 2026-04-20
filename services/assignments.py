@@ -64,7 +64,8 @@ async def get_assignments(course_code: Optional[str] = None):
 async def submit_assignment(
     assignment_id: str,
     student_id: str = Form(...),
-    answer_text: str = Form(...),
+    student_name: str = Form("Unknown Student"),
+    answer_text: str = Form(""),
     file: Optional[UploadFile] = File(None)
 ):
     try:
@@ -88,6 +89,7 @@ async def submit_assignment(
         submission_doc = {
             "assignment_id": assignment_id,
             "student_id": student_id,
+            "student_name": student_name,
             "answer_text": answer_text,
             "file_url": cloud_url,
             "submitted_at": datetime.now()

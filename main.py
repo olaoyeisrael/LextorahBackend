@@ -15,6 +15,7 @@ from services.chat import chat_with_model
 from fastapi.responses import StreamingResponse
 
 import json
+import re
 import requests
 import asyncio
 # from services.teach import generate_lesson_stream
@@ -1036,10 +1037,13 @@ async def add_curriculum(item: CurriculumItem, user: UserOutput = Depends(decode
     entry["course"] = entry["course"].lower()
     entry["level"] = entry["level"].lower()
     
-    # Auto-assign index if missing?
+    # Auto-assign index if missing
     if item.index is None:
-         # simple count
-         count = await curriculum_collection.count_documents({"course": item.course.lower(), "level": item.level.lower()})
+         # Count existing items for proper ordering
+         if item.course_code:
+             count = await curriculum_collection.count_documents({"course_code": item.course_code})
+         else:
+             count = await curriculum_collection.count_documents({"course": item.course.lower(), "level": item.level.lower()})
          entry["index"] = count
          
     entry["created_at"] = datetime.now()
@@ -1064,8 +1068,10 @@ async def add_curriculum_batch(items: list[CurriculumItem], user: UserOutput = D
     for item in items:
         entry = item.dict()
         if item.index is None:
-             # This is slow in loop but safer for order
-             count = await curriculum_collection.count_documents({"course": item.course, "level": item.level})
+             if item.course_code:
+                 count = await curriculum_collection.count_documents({"course_code": item.course_code})
+             else:
+                 count = await curriculum_collection.count_documents({"course": item.course, "level": item.level})
              entry["index"] = count
              
         entry["created_at"] = datetime.now()
@@ -1113,30 +1119,45 @@ async def update_curriculum(id: str, item: CurriculumUpdateRequest, user: UserOu
 
 @app.get('/curriculum')
 
-async def get_curriculum_list(course: str = Query(None), level: str = Query(None)):
+async def get_curriculum_list(course: str = Query(None), level: str = Query(None), course_code: str = Query(None)):
     from utils.mongodb import curriculum_collection
     
     query = {}
-    if course: query["course"] = {"$regex": f"^{course}$", "$options": "i"}
-    if level: query["level"] = {"$regex": f"^{level}$", "$options": "i"}
+    if course_code:
+        # Tutor filter: match by course_code directly
+        query["course_code"] = {"$regex": f"^{course_code}$", "$options": "i"}
+    else:
+        if course: query["course"] = {"$regex": f"^{course}$", "$options": "i"}
+        if level: query["level"] = {"$regex": f"^{level}$", "$options": "i"}
     
     cursor = curriculum_collection.find(query).sort("index", 1)
+
 
     items = await cursor.to_list(length=1000)
     
     # --- FETCH MATERIALS TO CHECK STATUS ---
     from utils.mongodb import course_collection
     
-    # Build a query for materials that match the requested course/level
+    # Build a query for materials that match the requested filters
     mat_query = {}
-    if course: mat_query["course_title"] = {"$regex": f"^{course}$", "$options": "i"}
-    if level: mat_query["level"] = {"$regex": f"^{level}$", "$options": "i"}
+    if course_code:
+        # When filtering by course_code, match materials by their course_code or topic
+        # Materials may not have course_code stored, so we'll match by topic from the fetched items
+        pass  # We'll match by topic below
+    else:
+        if course: mat_query["course_title"] = {"$regex": f"^{course}$", "$options": "i"}
+        if level: mat_query["level"] = {"$regex": f"^{level}$", "$options": "i"}
+    
+    # If we have items to check, also try matching by their topics
+    if course_code and items:
+        topic_list = [i.get("topic", "").strip().lower() for i in items if i.get("topic")]
+        if topic_list:
+            mat_query["topic"] = {"$regex": "|".join([f"^{t}$" for t in topic_list]), "$options": "i"}
     
     materials_cursor = course_collection.find(mat_query)
     materials = await materials_cursor.to_list(length=1000)
     
     # Map topic -> material_filename (normalize topic for matching)
-    # Using a dictionary where key is lowercase topic
     topic_material_map = {}
     for mat in materials:
         t = mat.get("topic", "").strip().lower()
@@ -1153,8 +1174,7 @@ async def get_curriculum_list(course: str = Query(None), level: str = Query(None
             i["material_filename"] = topic_material_map[curr_topic]
         else:
             i["material_filename"] = None
-
-    print("Curriculum Items with Material Status: ", items)
+    print("Curriculum items with material status: ", items)
         
     return {"curriculum": items}
 
@@ -1301,10 +1321,33 @@ class QuizResultDB(BaseModel):
     topic: str | None = None # Optional, inferred or provided
     level: str
     course_title: str
+    course_code: str | None = None
     score: int
     total: int
+    type: str # 'practice', 'mock', 'lesson_quiz', 'sprint_test'
     date: datetime | None = None
     details: list[dict] | None = None
+
+@app.get('/my_results')
+async def get_my_results(user: UserOutput = Depends(decode_token)):
+    from utils.mongodb import quiz_results_collection
+    from bson.objectid import ObjectId
+    from bson.errors import InvalidId
+    # Convert token string ID safely
+    try:
+        uid = ObjectId(user.id)
+    except InvalidId:
+        uid = user.id
+    
+    # Query for user's results
+    cursor = quiz_results_collection.find({"user_id": str(user.id)}).sort("date", -1)
+    results = await cursor.to_list(length=100)
+    for r in results:
+        r["id"] = str(r["_id"])
+        del r["_id"]
+        if isinstance(r.get("date"), datetime):
+            r["date"] = r["date"].isoformat()
+    return {"results": results}
 
 @app.post('/submit_quiz_result')
 async def submit_quiz_result(result: QuizResultDB, user: UserOutput = Depends(decode_token)):
@@ -1450,14 +1493,32 @@ async def complete_topic(req: TopicCompletionRequest, user: UserOutput = Depends
     return {"msg": "Topic completed", "course_completed": is_course_complete}
 
 @app.get('/student_performance')
-async def get_student_performance(user: UserOutput = Depends(decode_token)):
-    if user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admins only")
+async def get_student_performance(course_code: str = Query(None), user: UserOutput = Depends(decode_token)):
+    if user.role not in ("admin", "tutor"):
+        raise HTTPException(status_code=403, detail="Admins and tutors only")
         
-    from utils.mongodb import quiz_results_collection, user_course_collection
+    from utils.mongodb import quiz_results_collection, user_collection
     
+    # Base query
+    query = {}
+    
+    if user.role == "tutor":
+        # Tutors rely on the frontend sending their Laravel-injected managed course codes
+        # If no course_code is provided by frontend, return empty so they don't see all students globally
+        if not course_code:
+            return {"performance": []}
+            
+        codes = [c.strip() for c in course_code.split(",")]
+        regex_list = [f"^{c}$" for c in codes]
+        query["course_code"] = {"$in": [re.compile(r, re.IGNORECASE) for r in regex_list]}
+    else:
+        # Admin can see everything, filter if course_code provided
+        if course_code:
+            query["course_code"] = {"$regex": f"^{course_code}$", "$options": "i"}
+            print("Admin Query for Student Performance: ", query)
+
     # Fetch Quiz Results
-    cursor = quiz_results_collection.find().sort("date", -1)
+    cursor = quiz_results_collection.find(query).sort("date", -1)
     results = await cursor.to_list(length=200)
     
     # Map _id to id
@@ -1476,6 +1537,7 @@ async def get_student_performance(user: UserOutput = Depends(decode_token)):
     
     if results and len(results) > 0:
         print("DEBUG: Sample Result Details:", results[0].get("details"))
+    print(f"Fetched {len(results)} quiz results for performance overview.")
 
     return {"performance": results}
     
