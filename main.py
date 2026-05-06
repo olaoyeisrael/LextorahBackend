@@ -161,7 +161,7 @@ async def stream_classroom_section(user_id: str, topic: str, sprint_id: int = No
     resolved_topic = topic
     if sprint_id:
         from utils.mongodb import sprints_collection
-        sprint = await sprints_collection.find_one({"id": sprint_id})
+        sprint = await sprints_collection.find_one({"sprint_id": str(sprint_id)})
         if sprint:
             sprint_course_code = sprint.get("course_code")
             if not resolved_topic and "curriculum" in sprint and len(sprint["curriculum"]) > 0:
@@ -1569,23 +1569,33 @@ async def _send_email(subject: str, html_body: str, to_emails=None):
         to_emails = [NOTIFICATION_EMAIL]
 
     try:
-        import resend
-        resend.api_key = os.getenv("RESEND_API_KEY")
+        import mailtrap as mt
+        mailtrap_token = os.getenv("MAILTRAP_TOKEN")
+        mailtrap_inbox_id = os.getenv("MAILTRAP_INBOX_ID")
 
-        if not resend.api_key:
-            print("RESEND_API_KEY not set — skipping email")
+        if not mailtrap_token:
+            print("MAILTRAP_TOKEN not set — skipping email")
             return
 
-        await asyncio.to_thread(
-            resend.Emails.send,
-            {
-                "from": "Lextorah Notifications <onboarding@resend.dev>",
-                "to": to_emails,
-                "subject": subject,
-                "html": html_body,
-            }
+        # Remove duplicates while preserving order
+        unique_emails = list(dict.fromkeys([email.strip() for email in to_emails if email.strip()]))
+        to_addresses = [mt.Address(email=email) for email in unique_emails]
+
+        mail = mt.Mail(
+            sender=mt.Address(email="hello@demomailtrap.com", name="Lextorah Notifications"),
+            to=to_addresses,
+            subject=subject,
+            html=html_body,
+            category="Notification"
         )
-        print(f"Notification email sent: {subject} to {to_emails}")
+
+        # if mailtrap_inbox_id:
+        #     client = mt.MailtrapClient(token=mailtrap_token, sandbox=True, inbox_id=int(mailtrap_inbox_id))
+        # else:
+        client = mt.MailtrapClient(token=mailtrap_token)
+
+        client.send(mail)
+        print(f"Notification email sent via Mailtrap: {subject} to {to_emails}")
     except Exception as e:
         print(f"Email send failed (non-fatal): {e}")
 
@@ -1615,14 +1625,15 @@ async def save_starterpack(data: dict):
     await starterpack_collection.insert_one(data)
 
     # Admin notification (always)
-    await _send_email(
-        subject=f"New Starter Pack Request from {data.get('institutionName', 'Unknown Institution')}",
-        html_body=f"<h2>New Starter Pack Request</h2>{_format_dict_as_html(data)}"
-    )
+    # await _send_email(
+    #     subject=f"New Starter Pack Request from {data.get('institutionName', 'Unknown Institution')}",
+    #     html_body=f"<h2>New Starter Pack Request</h2>{_format_dict_as_html(data)}"
+    # )
 
     # User notification (when requester email is provided)
     user_email = data.get("email")
-    drive_link = "https://drive.google.com/drive/u/0/folders/1Gu9BO2mxvamq1DDF9-53fTv44vVRG4dk"
+    drive_link = "https://res.cloudinary.com/depx394l8/image/upload/v1777901126/Lextorah_AI_Starter_Pack_2_xhvqwc.pdf"
+    print(f"User email for Starter Pack access: {user_email}")
 
     if user_email:
         user_html = "<h2>Starter Pack Access</h2>"
@@ -1636,6 +1647,37 @@ async def save_starterpack(data: dict):
         )
 
     return {"msg": "Starter Pack request received. We have sent the access link to your email!"}
+
+@app.post('/request-institutional-access')
+async def request_institutional_access(data: dict):
+    """
+    Public endpoint — no auth required.
+    Saves Institutional Access form submission and emails admin and optionally the requester.
+    """
+    from utils.mongodb import institutional_access_collection
+    data["submitted_at"] = datetime.now()
+    await institutional_access_collection.insert_one(data)
+
+    # Admin notification (always)
+    await _send_email(
+        subject=f"New Institutional Access Request from {data.get('institutionName', 'Unknown Institution')}",
+        html_body=f"<h2>New Institutional Access Request</h2>{_format_dict_as_html(data)}"
+    )
+
+    # User notification (when requester email is provided)
+    # user_email = data.get("email")
+    # if user_email:
+    #     user_html = "<h2>Institutional Access Request Received</h2>"
+    #     user_html += "<p>Thank you for requesting institutional access to Lextorah Education.</p>"
+    #     user_html += "<p>We have received your application and our team will review it and get back to you soon.</p>"
+
+    #     await _send_email(
+    #         subject="We have received your Institutional Access Request",
+    #         html_body=user_html,
+    #         to_emails=[user_email]
+    #     )
+
+    return {"msg": "Your institutional access request has been successfully submitted!"}
 
 @app.post('/book-demo')
 async def book_demo():

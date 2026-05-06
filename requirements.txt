@@ -27,7 +27,7 @@ dataclasses-json==0.6.7
 Deprecated==1.2.18
 distro==1.9.0
 dnspython==2.7.0
-duckduckgo_search==8.1.1
+beautifulsoup4==4.12.3
 durationpy==0.9
 ecdsa==0.19.1
 email_validator==2.2.0
@@ -219,3 +219,4 @@ yarl==1.19.0
 zipp==3.21.0
 zstandard==0.23.0
 cloudinary
+mailtrap==2.5.0

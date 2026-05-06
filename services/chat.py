@@ -162,24 +162,30 @@ def get_in_memory_history(session_id: str) -> ChatMessageHistory:
         in_memory_store[session_id] = ChatMessageHistory()
     return in_memory_store[session_id]
 
-from duckduckgo_search import DDGS
+from langchain_community.document_loaders import WebBaseLoader
 
 from langchain_core.tools import tool
 
 @tool
-def search_lextorah_elearning(query: str) -> str:
-    """Search the lextorah-elearning.com website for answers to customer support queries."""
+def load_lextorah_page(url: str) -> str:
+    """Load a specific page from the lextorah-elearning.com website to find answers to customer support queries."""
     try:
-        results = DDGS().text(f"site:lextorah-elearning.com {query}", max_results=3)
-        return "\n\n".join([f"Title: {r['title']}\nSnippet: {r['body']}\nLink: {r['href']}" for r in results])
+        if "lextorah-elearning.com" not in url:
+             return "Please only load URLs from lextorah-elearning.com."
+             
+        loader = WebBaseLoader(url)
+        docs = loader.load()
+        content = docs[0].page_content if docs else ""
+        print(f"Loaded content from {url}: {content[:200]}...")  # Log the first 200 characters for debugging
+        return content[:4000]
     except Exception as e:
-        print(f"Search error: {e}")
-        return "No relevant information found."
+        print(f"Load error: {e}")
+        return "Failed to load the web page."
 
 
 
-support_tools = [search_lextorah_elearning]
-support_agent = create_agent(model=llm, tools = support_tools, system_prompt=("You are Ms Lexi, a helpful customer support agent for Lextorah. Use the search_lextorah_elearning tool to search https://www.lextorah-elearning.com/ for information to answer the user's question. Be polite, concise, and helpful."), checkpointer=MemorySaver())
+support_tools = [load_lextorah_page]
+support_agent = create_agent(model=llm, tools=support_tools, system_prompt=("You are Ms Lexi, a helpful customer support agent for Lextorah. Use the load_lextorah_page tool to load pages from https://www.lextorah-elearning.com/ (e.g., https://www.lextorah-elearning.com/about) to find information to answer the user's question. You must STRICTLY restrict your answers to topics related to Lextorah. If a user asks a question entirely unrelated to Lextorah or its services, politely decline to answer. Be polite, concise, and helpful."), checkpointer=MemorySaver())
 
 
 async def chat_support(session_id: str, question: str):

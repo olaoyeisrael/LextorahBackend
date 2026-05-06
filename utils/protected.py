@@ -34,7 +34,7 @@ def decode_token(token: str = Depends(get_token_from_header)):
             token, 
             SECRET_KEY, 
             algorithms=["HS256"],
-            options={"verify_aud": False, "verify_iss": False, "verify_nbf": False}
+            options={"verify_aud": False, "verify_iss": False, "verify_nbf": False, "verify_exp": False}
         )
         print("Decoded JWT Payload: ", payload)
         student_id = payload.get("student_id")
