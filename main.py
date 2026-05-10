@@ -13,6 +13,7 @@ from services.chat import chat_with_model
 # from services.teaching import stream_teach
 # from services.teaching import stream_teach
 from fastapi.responses import StreamingResponse
+import httpx
 
 import json
 import re
@@ -1564,38 +1565,40 @@ def _format_dict_as_html(data: dict) -> str:
     )
     return f"<table style='border-collapse:collapse;width:100%'>{rows}</table>"
 
-async def _send_email(subject: str, html_body: str, to_emails=None):
+async def _send_email(subject: str, html_body: str, to_emails=None, action_text: str = "View Lextorah", action_url: str = "https://lextorah-elearning.com"):
     if to_emails is None:
         to_emails = [NOTIFICATION_EMAIL]
 
+    import httpx
+    url = "https://lextorah-elearning.com/elearning/api/send-email"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Internal-Token": "75926e792cd2c1f6d59be6097ab3bdce116dfd8eb9bf678616cb65351b805437"
+    }
+
     try:
-        import mailtrap as mt
-        mailtrap_token = os.getenv("MAILTRAP_TOKEN")
-        mailtrap_inbox_id = os.getenv("MAILTRAP_INBOX_ID")
-
-        if not mailtrap_token:
-            print("MAILTRAP_TOKEN not set — skipping email")
-            return
-
         # Remove duplicates while preserving order
         unique_emails = list(dict.fromkeys([email.strip() for email in to_emails if email.strip()]))
-        to_addresses = [mt.Address(email=email) for email in unique_emails]
+        print('Url for email API: ', url)
+        print('Unique emails: ', unique_emails)
 
-        mail = mt.Mail(
-            sender=mt.Address(email="hello@demomailtrap.com", name="Lextorah Notifications"),
-            to=to_addresses,
-            subject=subject,
-            html=html_body,
-            category="Notification"
-        )
-
-        # if mailtrap_inbox_id:
-        #     client = mt.MailtrapClient(token=mailtrap_token, sandbox=True, inbox_id=int(mailtrap_inbox_id))
-        # else:
-        client = mt.MailtrapClient(token=mailtrap_token)
-
-        client.send(mail)
-        print(f"Notification email sent via Mailtrap: {subject} to {to_emails}")
+        async with httpx.AsyncClient() as client:
+            for email in unique_emails:
+                payload = {
+                    "email": email,
+                    "subject": subject,
+                    "body": html_body,
+                    "greeting": "Hello,",
+                    "action_text": action_text,
+                    "action_url": action_url,
+                    "queue": False
+                }
+                response = await client.post(url, json=payload, headers=headers, timeout=10.0)
+                print(f"Email API response for {email}: {response.status_code} {response.text}")
+                if response.status_code >= 400:
+                    print(f"Failed to send email to {email} via custom API: {response.status_code} {response.text}")
+                else:
+                    print(f"Notification email sent via custom API: {subject} to {email}")
     except Exception as e:
         print(f"Email send failed (non-fatal): {e}")
 
@@ -1625,10 +1628,11 @@ async def save_starterpack(data: dict):
     await starterpack_collection.insert_one(data)
 
     # Admin notification (always)
-    # await _send_email(
-    #     subject=f"New Starter Pack Request from {data.get('institutionName', 'Unknown Institution')}",
-    #     html_body=f"<h2>New Starter Pack Request</h2>{_format_dict_as_html(data)}"
-    # )
+    await _send_email(
+        subject=f"New Starter Pack Request from {data.get('institutionName', 'Unknown Institution')}",
+        html_body=f"<h2>New Starter Pack Request</h2>{_format_dict_as_html(data)}"
+    )
+    print("Admin email sent for Starter Pack request.")
 
     # User notification (when requester email is provided)
     user_email = data.get("email")
@@ -1638,13 +1642,16 @@ async def save_starterpack(data: dict):
     if user_email:
         user_html = "<h2>Starter Pack Access</h2>"
         user_html += "<p>Thanks for requesting the Starter Pack.</p>"
-        user_html += f"<p>Your Starter Pack is available here: <a href=\"{drive_link}\" target=\"_blank\">Open Starter Pack</a></p>"
+        user_html += f"<p>Your Starter Pack is available here:</p>"
 
         await _send_email(
             subject="Your Starter Pack Access Link",
             html_body=user_html,
-            to_emails=[user_email, NOTIFICATION_EMAIL]
+            to_emails=[user_email],
+            action_text="Open Starter Pack",
+            action_url=drive_link
         )
+        print(f"Access email sent to requester: {user_email}")
 
     return {"msg": "Starter Pack request received. We have sent the access link to your email!"}
 
@@ -1658,30 +1665,57 @@ async def request_institutional_access(data: dict):
     data["submitted_at"] = datetime.now()
     await institutional_access_collection.insert_one(data)
 
-    # Admin notification (always)
+    # Admin notification 
     await _send_email(
         subject=f"New Institutional Access Request from {data.get('institutionName', 'Unknown Institution')}",
         html_body=f"<h2>New Institutional Access Request</h2>{_format_dict_as_html(data)}"
     )
 
-    # User notification (when requester email is provided)
-    # user_email = data.get("email")
-    # if user_email:
-    #     user_html = "<h2>Institutional Access Request Received</h2>"
-    #     user_html += "<p>Thank you for requesting institutional access to Lextorah Education.</p>"
-    #     user_html += "<p>We have received your application and our team will review it and get back to you soon.</p>"
+    # User notification 
+    user_email = data.get("email")
+    if user_email:
+        user_html = "<h2>Institutional Access Request Received</h2>"
+        user_html += "<p>Thank you for requesting institutional access to Lextorah Education.</p>"
+        user_html += "<p>We have received your application and our team will review it and get back to you soon.</p>"
 
-    #     await _send_email(
-    #         subject="We have received your Institutional Access Request",
-    #         html_body=user_html,
-    #         to_emails=[user_email]
-    #     )
+        await _send_email(
+            subject="We have received your Institutional Access Request",
+            html_body=user_html,
+            to_emails=[user_email]
+        )
 
     return {"msg": "Your institutional access request has been successfully submitted!"}
 
 @app.post('/book-demo')
-async def book_demo():
-    pass
+async def book_demo(data: dict):
+    """
+    Public endpoint — no auth required.
+    Saves Book Demo form submission and emails admin and optionally the requester.
+    """
+    from utils.mongodb import book_demos_collection
+    data["submitted_at"] = datetime.now()
+    await book_demos_collection.insert_one(data)
+
+    # Admin notification 
+    await _send_email(
+        subject=f"New Demo Request from {data.get('institutionName', data.get('fullName', 'Unknown'))}",
+        html_body=f"<h2>New Book Demo Request</h2>{_format_dict_as_html(data)}"
+    )
+
+    # User notification 
+    user_email = data.get("email")
+    if user_email:
+        user_html = "<h2>Demo Request Received</h2>"
+        user_html += "<p>Thank you for requesting a demo with Lextorah Education.</p>"
+        user_html += "<p>Our team will be in touch with you shortly to schedule the session.</p>"
+
+        await _send_email(
+            subject="We have received your Demo Request",
+            html_body=user_html,
+            to_emails=[user_email]
+        )
+
+    return {"msg": "Your demo request has been successfully submitted!"}
 
 
 @app.post('/save_quiz_result')
