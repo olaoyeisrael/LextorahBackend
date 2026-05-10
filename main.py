@@ -1555,7 +1555,7 @@ async def get_student_performance(course_code: str = Query(None), user: UserOutp
 
 import asyncio
 
-NOTIFICATION_EMAIL = "olaoyeaisrael@gmail.com"
+NOTIFICATION_EMAIL = "info@lextorah.com"
 
 def _format_dict_as_html(data: dict) -> str:
     rows = "".join(
