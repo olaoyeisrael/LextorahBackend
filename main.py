@@ -1557,6 +1557,7 @@ import asyncio
 
 NOTIFICATION_EMAIL = "info@lextorah.com"
 
+
 def _format_dict_as_html(data: dict) -> str:
     rows = "".join(
         f"<tr><td style='padding:6px 12px;font-weight:bold;border:1px solid #e5e7eb;background:#f9fafb'>{k}</td>"
