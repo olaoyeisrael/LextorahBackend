@@ -852,8 +852,8 @@ async def upload_material_endpoint(
     file: UploadFile = File(...),
     user: UserOutput = Depends(decode_token)
 ):
-    if user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admins only")
+    if user.role not in ["admin", "tutor"]:
+        raise HTTPException(status_code=403, detail="Admins and Tutors only")
 
     res = await uploadMaterial(course_title.lower(), topic, skill, level.lower(), file)
 

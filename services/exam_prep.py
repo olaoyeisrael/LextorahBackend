@@ -27,6 +27,7 @@ For each question, classify it as one of:
 
 Output ONLY a valid JSON array. Each object must have these fields:
 - "type": "objective" or "fill_in_gap"
+- "instruction": any context, story, passage, or instructions associated with the question (e.g., "Read the following passage and answer the questions below: [Passage text]" or "Conjugate the verbs"). If none, use an empty string.
 - "question": the question text (for fill_in_gap, include the blank as "___")
 - "options": array of 4 option strings (for objective only, use empty array [] for fill_in_gap)
 - "answer": the correct answer
@@ -162,6 +163,7 @@ async def upload_exam_questions(
                 "course_code": course_code,
                 "tutor_id": tutor_id,
                 "type": q.get("type", "objective"),
+                "instruction": q.get("instruction", ""),
                 "question": q.get("question", ""),
                 "options": q.get("options", []),
                 "answer": q.get("answer", ""),

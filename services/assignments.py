@@ -15,6 +15,7 @@ async def create_assignment(
     course_code: str = Form(...),
     question_text: str = Form(...),
     tutor_id: str = Form(...),
+    deadline: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None)
 ):
     try:
@@ -32,6 +33,7 @@ async def create_assignment(
             "course_code": course_code,
             "question_text": question_text,
             "tutor_id": tutor_id,
+            "deadline": deadline,
             "file_url": cloud_url,
             "created_at": datetime.now()
         }
@@ -42,12 +44,16 @@ async def create_assignment(
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/assignments")
-async def get_assignments(course_code: Optional[str] = None):
+async def get_assignments(course_code: Optional[str] = None, tutor_id: Optional[str] = None):
     try:
         query = {}
         if course_code:
             codes = [c.strip() for c in course_code.split(",")]
             query["course_code"] = {"$in": codes}
+            print("Filtering by course codes:", codes)
+        if tutor_id:
+            query["tutor_id"] = tutor_id
+            print("Filtering by tutor ID:", tutor_id)
         
         cursor = assignments_collection.find(query).sort("created_at", -1)
         assignments = await cursor.to_list(length=100)
@@ -76,6 +82,16 @@ async def submit_assignment(
         })
         if existing:
             raise HTTPException(status_code=409, detail="You have already submitted this assignment.")
+            
+        # Check deadline
+        assignment = await assignments_collection.find_one({"_id": ObjectId(assignment_id)})
+        if assignment and assignment.get("deadline"):
+            try:
+                deadline_date = datetime.fromisoformat(assignment["deadline"])
+                if datetime.now() > deadline_date:
+                    raise HTTPException(status_code=403, detail="The deadline for this assignment has passed.")
+            except ValueError:
+                pass # Ignore parsing errors for old or invalid dates
 
         cloud_url = None
         if file:

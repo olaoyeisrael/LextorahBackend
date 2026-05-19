@@ -13,15 +13,15 @@ from services.cloudinary_client import upload_image, upload_video, uploadMateria
 from utils.mongodb import course_collection
 from utils.whisper import transcribe_audio
 from datetime import datetime
+import io
+import base64
+from PIL import Image
+from langchain_core.messages import HumanMessage
+from services.model import llm
 
 load_dotenv()
 
-# from langchain.vectorstores import Pinecone
-# client = chromadb.CloudClient(
-#   api_key='ck-6VA54Ws8DdwVkBzmoph69rcRCjCaKNGioehygzE8f8cA',
-#   tenant='32dc770a-381e-4b0e-b9c1-91d1d88a790c',
-#   database='lextorahmaterials'
-# )
+
 pc = Pinecone(api_key=os.getenv('PINECONE_API'))
 index = pc.Index("lextorahdb")
 
@@ -29,11 +29,43 @@ def extract_text_from_file(filepath: str, filename: str):
     text = ""
     if filename.endswith(".pdf"):
         reader = PdfReader(filepath)
-        text = ""
         for page in reader.pages:
             page_text = page.extract_text()
             if page_text:
                 text += page_text + "\n"
+                
+            # Extract images from the page and use Vision model to extract text
+            if hasattr(page, "images"):
+                for image_file_object in page.images:
+                    try:
+                        # Convert image data to base64 JPEG
+                        image = Image.open(io.BytesIO(image_file_object.data))
+                        buffered = io.BytesIO()
+                        image.convert("RGB").save(buffered, format="JPEG")
+                        base64_image = base64.b64encode(buffered.getvalue()).decode("utf-8")
+                        
+                        # Send image to the model to perform OCR
+                        msg = HumanMessage(
+                            content=[
+                                {
+                                    "type": "text", 
+                                    "text": "Extract all the text you can see in this image. Do not include any explanations, just the text. If there is no text, return an empty string."
+                                },
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{base64_image}"
+                                    },
+                                },
+                            ]
+                        )
+                        
+                        response = llm.invoke([msg])
+                        if response.content and response.content.strip():
+                            text += "\n" + response.content.strip() + "\n"
+                    except Exception as e:
+                        print(f"Vision OCR failed for an image in {filename}: {e}")
+
     elif filename.endswith((".mp3", ".wav", ".mp4")):
         text = transcribe_audio(filepath)
 
@@ -91,6 +123,9 @@ async def uploadMaterial(
 
         # 4. Extract & Vectorize
         text = extract_text_from_file(filepath, file.filename)
+        # print(f"====== EXTRACTED CONTENT START ({file.filename}) ======")
+        # print(text)
+        # print("====== EXTRACTED CONTENT END ======")
         chunks = chunk_text(text)
         embeddings = []
         for chunk in chunks:
@@ -111,7 +146,8 @@ async def uploadMaterial(
                     "topic": topic
                 }
             })
-        index.upsert(vectors=vectors)
+        if vectors:
+            index.upsert(vectors=vectors)
         # os.makedirs("materials", exist_ok=True)
         # filepath = os.path.join("materials", file.filename)
         # with open(filepath, "wb") as f:
