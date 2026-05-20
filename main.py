@@ -153,7 +153,7 @@ def get_sections_for_user(user, mat):
     
     return [{"title": f"Part {i+1}", "content": chunk} for i, chunk in enumerate(chunks)]
 @app.get("/classroom/next/{user_id}")
-async def stream_classroom_section(user_id: str, topic: str, sprint_id: int = None, section: int = None):
+async def stream_classroom_section(user_id: str, topic: str, sprint_id: int = None, section: int = None, course_code: str = None):
     # 1. Fetch User and Determine Sprint Topic
     user = await get_user(user_id)
     
@@ -173,19 +173,20 @@ async def stream_classroom_section(user_id: str, topic: str, sprint_id: int = No
     # 2. Extract Sections for ALL topics in the string (comma-separated if array)
     topics_list = [t.strip() for t in resolved_topic.split(',') if t.strip()]
     
+    # Resolve the course code
+    actual_course_code = course_code or sprint_course_code
+    
     sections = []
     for single_topic in topics_list:
         safe_topic = re.escape(single_topic) # Escape "()", "+", etc. so $regex works purely as a string match
         
-        # Create lookup for this specific topic
+        # Create lookup for this specific topic and course code (stored as course_title in DB)
         mat_query = {
             "topic": {"$regex": f"^{safe_topic}$", "$options": "i"}
         }
         
-        # Optionally bind to their enrolled course/level to prevent pulling the wrong PDF 
-        # (Using a very loose contains search because enrolled_course might be "German" while course_title in DB is "FRE/A1/WD/177")
-        if user.get("enrolled_level"):
-            mat_query["level"] = {"$regex": f"^{user['enrolled_level']}$", "$options": "i"}
+        if actual_course_code:
+            mat_query["course_title"] = {"$regex": f"^{re.escape(actual_course_code.strip())}$", "$options": "i"}
         
         print(f"DEBUG DB QUERY: {mat_query}")
             
@@ -1123,13 +1124,15 @@ async def update_curriculum(id: str, item: CurriculumUpdateRequest, user: UserOu
 async def get_curriculum_list(course: str = Query(None), level: str = Query(None), course_code: str = Query(None)):
     from utils.mongodb import curriculum_collection
     
+    # Prioritize course_code and ignore course/level if course_code is present
+    actual_code = course_code
+    
     query = {}
-    if course_code:
-        # Tutor filter: match by course_code directly
-        query["course_code"] = {"$regex": f"^{course_code}$", "$options": "i"}
+    if actual_code:
+        query["course_code"] = {"$regex": f"^{re.escape(actual_code)}$", "$options": "i"}
     else:
-        if course: query["course"] = {"$regex": f"^{course}$", "$options": "i"}
-        if level: query["level"] = {"$regex": f"^{level}$", "$options": "i"}
+        if course: query["course"] = {"$regex": f"^{re.escape(course)}$", "$options": "i"}
+        if level: query["level"] = {"$regex": f"^{re.escape(level)}$", "$options": "i"}
     
     cursor = curriculum_collection.find(query).sort("index", 1)
 
@@ -1139,21 +1142,21 @@ async def get_curriculum_list(course: str = Query(None), level: str = Query(None
     # --- FETCH MATERIALS TO CHECK STATUS ---
     from utils.mongodb import course_collection
     
-    # Build a query for materials that match the requested filters
+    # Build a query for materials that match by course_code
     mat_query = {}
-    if course_code:
-        # When filtering by course_code, match materials by their course_code or topic
-        # Materials may not have course_code stored, so we'll match by topic from the fetched items
-        pass  # We'll match by topic below
+    if actual_code:
+        # Match materials by their course_title (which stores course_code)
+        mat_query["course_title"] = {"$regex": f"^{re.escape(actual_code)}$", "$options": "i"}
     else:
-        if course: mat_query["course_title"] = {"$regex": f"^{course}$", "$options": "i"}
-        if level: mat_query["level"] = {"$regex": f"^{level}$", "$options": "i"}
+        if course: mat_query["course_title"] = {"$regex": f"^{re.escape(course)}$", "$options": "i"}
+        if level: mat_query["level"] = {"$regex": f"^{re.escape(level)}$", "$options": "i"}
     
-    # If we have items to check, also try matching by their topics
-    if course_code and items:
-        topic_list = [i.get("topic", "").strip().lower() for i in items if i.get("topic")]
+    # If we have items to check, also filter by their topics to reduce DB payload (regex escaped for safety)
+    if items:
+        topic_list = [i.get("topic", "").strip() for i in items if i.get("topic")]
         if topic_list:
-            mat_query["topic"] = {"$regex": "|".join([f"^{t}$" for t in topic_list]), "$options": "i"}
+            escaped_topics = [f"^{re.escape(t)}$" for t in topic_list]
+            mat_query["topic"] = {"$regex": "|".join(escaped_topics), "$options": "i"}
     
     materials_cursor = course_collection.find(mat_query)
     materials = await materials_cursor.to_list(length=1000)
@@ -1174,7 +1177,8 @@ async def get_curriculum_list(course: str = Query(None), level: str = Query(None
         if curr_topic in topic_material_map:
             i["material_filename"] = topic_material_map[curr_topic]
         else:
-            i["material_filename"] = None
+            # Fallback to stored material_filename in the curriculum document itself
+            i["material_filename"] = i.get("material_filename") or None
     print("Curriculum items with material status: ", items)
         
     return {"curriculum": items}

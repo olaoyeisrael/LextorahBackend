@@ -10,7 +10,7 @@ from pinecone import Pinecone
 from dotenv import load_dotenv
 from langchain_pinecone import PineconeVectorStore
 from services.cloudinary_client import upload_image, upload_video, uploadMaterialToCloudinary
-from utils.mongodb import course_collection
+from utils.mongodb import course_collection, curriculum_collection
 from utils.whisper import transcribe_audio
 from datetime import datetime
 import io
@@ -29,12 +29,17 @@ def extract_text_from_file(filepath: str, filename: str):
     text = ""
     if filename.endswith(".pdf"):
         reader = PdfReader(filepath)
+        
+        # 1. Extract all raw text from pages
         for page in reader.pages:
             page_text = page.extract_text()
             if page_text:
                 text += page_text + "\n"
-                
-            # Extract images from the page and use Vision model to extract text
+        print("Text extraction from all pages completed")
+        
+        # 2. Extract all images across all pages
+        base64_images = []
+        for page_idx, page in enumerate(reader.pages):
             if hasattr(page, "images"):
                 for image_file_object in page.images:
                     try:
@@ -43,28 +48,38 @@ def extract_text_from_file(filepath: str, filename: str):
                         buffered = io.BytesIO()
                         image.convert("RGB").save(buffered, format="JPEG")
                         base64_image = base64.b64encode(buffered.getvalue()).decode("utf-8")
-                        
-                        # Send image to the model to perform OCR
-                        msg = HumanMessage(
-                            content=[
-                                {
-                                    "type": "text", 
-                                    "text": "Extract all the text you can see in this image. Do not include any explanations, just the text. If there is no text, return an empty string."
-                                },
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/jpeg;base64,{base64_image}"
-                                    },
-                                },
-                            ]
-                        )
-                        
-                        response = llm.invoke([msg])
-                        if response.content and response.content.strip():
-                            text += "\n" + response.content.strip() + "\n"
+                        base64_images.append(base64_image)
                     except Exception as e:
-                        print(f"Vision OCR failed for an image in {filename}: {e}")
+                        print(f"Failed to extract image on page {page_idx+1} in {filename}: {e}")
+        
+        # 3. Send all extracted images to the model at once (batched in groups of 15 for safety)
+        if base64_images:
+            try:
+                print(f"Sending all {len(base64_images)} images to model for OCR at once...")
+                batch_size = 15
+                for i in range(0, len(base64_images), batch_size):
+                    batch = base64_images[i:i+batch_size]
+                    content_payload = [
+                        {
+                            "type": "text", 
+                            "text": "Extract all the text you can see in these images. Do not include any explanations, just the text. Maintain the order of the text if possible."
+                        }
+                    ]
+                    for base64_image in batch:
+                        content_payload.append({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        })
+                    
+                    msg = HumanMessage(content=content_payload)
+                    response = llm.invoke([msg])
+                    if response.content and response.content.strip():
+                        text += "\n" + response.content.strip() + "\n"
+                print("Bulk Vision OCR completed successfully")
+            except Exception as e:
+                print(f"Bulk Vision OCR failed for {filename}: {e}")
 
     elif filename.endswith((".mp3", ".wav", ".mp4")):
         text = transcribe_audio(filepath)
@@ -82,6 +97,18 @@ async def uploadMaterial(
     level: str = Form(...),
     file : UploadFile = File(...) 
 ) -> str:
+    import re
+    # Check if topic and course code (course_title) already exist in DB to avoid duplicates
+    existing = await course_collection.find_one({
+        "course_title": {"$regex": f"^{re.escape(course_title.strip())}$", "$options": "i"},
+        "topic": {"$regex": f"^{re.escape(topic.strip())}$", "$options": "i"}
+    })
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"A material for topic '{topic}' in course '{course_title}' already exists."
+        )
+
     try:
         # 1. Save locally for teach_ws access
         os.makedirs("materials", exist_ok=True)
@@ -120,6 +147,26 @@ async def uploadMaterial(
         # Let's just insert for now.
         inserted = await course_collection.insert_one(course_doc)
         course_id = str(inserted.inserted_id)
+
+        # Update matching curriculum item(s) to set material_filename
+        try:
+            import re
+            # Match by topic name and course_code case-insensitively (regex escaped for safety)
+            update_query = {
+                "topic": {"$regex": f"^{re.escape(topic.strip())}$", "$options": "i"},
+                "course_code": {"$regex": f"^{re.escape(course_title.strip())}$", "$options": "i"}
+            }
+            
+            await curriculum_collection.update_many(
+                update_query,
+                {"$set": {
+                    "material_filename": file.filename,
+                    "updated_at": datetime.now()
+                }}
+            )
+            print(f"Updated curriculum items for topic '{topic}' and course_code '{course_title}' to filename '{file.filename}'")
+        except Exception as update_err:
+            print(f"Failed to update curriculum item: {update_err}")
 
         # 4. Extract & Vectorize
         text = extract_text_from_file(filepath, file.filename)
