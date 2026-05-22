@@ -1570,7 +1570,7 @@ def _format_dict_as_html(data: dict) -> str:
     )
     return f"<table style='border-collapse:collapse;width:100%'>{rows}</table>"
 
-async def _send_email(subject: str, html_body: str, to_emails=None, action_text: str = "View Lextorah", action_url: str = "https://lextorah-elearning.com"):
+async def _send_email(subject: str, html_body: str, to_emails=None, action_text: str = "View Lextorah AI", action_url: str = "https://www.lextorah.ai/"):
     if to_emails is None:
         to_emails = [NOTIFICATION_EMAIL]
 
@@ -1593,7 +1593,7 @@ async def _send_email(subject: str, html_body: str, to_emails=None, action_text:
                     "email": email,
                     "subject": subject,
                     "body": html_body,
-                    "greeting": "Hello,",
+                    # "greeting": "Hello,",
                     "action_text": action_text,
                     "action_url": action_url,
                     "queue": False
@@ -1645,16 +1645,38 @@ async def save_starterpack(data: dict):
     print(f"User email for Starter Pack access: {user_email}")
 
     if user_email:
-        user_html = "<h2>Starter Pack Access</h2>"
-        user_html += "<p>Thanks for requesting the Starter Pack.</p>"
-        user_html += f"<p>Your Starter Pack is available here:</p>"
+        user_html = f"""
+        <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #333333; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #eeeeee; border-radius: 8px;">
+            <p>Thank you for your interest in Lextorah AI.</p>
+            <p>We are excited to support your journey toward smarter, future-ready teaching and learning.</p>
+            <p>Your Lextorah AI Starter Pack is now ready for download using the link below:</p>
+            
+            <p style="margin: 20px 0;">
+                🔗 <strong>Download Starter Pack:</strong> <a href="{drive_link}" style="color: #007bff; text-decoration: none; font-weight: bold;">Click Here to Download</a>
+            </p>
+            
+            <p>The Starter Pack includes:<br>
+            ✅ Introduction to Lextorah AI<br>
+            ✅ AI-powered education transformation overview<br>
+            ✅ Smart learning and teaching insights<br>
+            ✅ School transformation opportunities<br>
+            ✅ Getting started guide for schools and educators</p>
+            
+            <p>At Lextorah AI, we partner with schools and educators to drive meaningful transformation in teaching, learning, and future readiness.</p>
+            <p>Should you require a personalized demo or consultation for your school or institution, kindly reply to this email or book a demo with our team.</p>
+            <p>We look forward to supporting your educational transformation journey.</p>
+            
+            <p>Warm regards,</p>
+            <p><strong>Lextorah AI Team</strong><br>
+            🌐 <a href="https://www.lextorah.ai" style="color: #007bff; text-decoration: none;">www.lextorah.ai</a><br>
+            📧 <a href="mailto:info@lextorah.com" style="color: #007bff; text-decoration: none;">info@lextorah.com</a></p>
+        </div>
+        """
 
         await _send_email(
-            subject="Your Starter Pack Access Link",
+            subject="Your Lextorah AI Starter Pack is Ready",
             html_body=user_html,
             to_emails=[user_email],
-            action_text="Open Starter Pack",
-            action_url=drive_link
         )
         print(f"Access email sent to requester: {user_email}")
 
@@ -1682,6 +1704,10 @@ async def request_institutional_access(data: dict):
         user_html = "<h2>Institutional Access Request Received</h2>"
         user_html += "<p>Thank you for requesting institutional access to Lextorah Education.</p>"
         user_html += "<p>We have received your application and our team will review it and get back to you soon.</p>"
+        user_html += "<p>Warm regards,</p>" 
+        user_html += "<p><strong>Lextorah AI Team</strong><br>"
+        user_html += "🌐 <a href=\"https://www.lextorah.ai\" style=\"color: #007bff; text-decoration: none;\">www.lextorah.ai</a><br>"
+        user_html += "📧 <a href=\"mailto:info@lextorah.com\" style=\"color: #007bff; text-decoration: none;\">info@lextorah.com</a></p>"
 
         await _send_email(
             subject="We have received your Institutional Access Request",
@@ -1710,12 +1736,20 @@ async def book_demo(data: dict):
     # User notification 
     user_email = data.get("email")
     if user_email:
-        user_html = "<h2>Demo Request Received</h2>"
-        user_html += "<p>Thank you for requesting a demo with Lextorah Education.</p>"
-        user_html += "<p>Our team will be in touch with you shortly to schedule the session.</p>"
+        user_html = """
+        <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #333333; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #eeeeee; border-radius: 8px;">
+            <p>Thank you for your interest in Lextorah AI.</p>
+            <p>We have successfully received your demo request. A member of our team will contact you shortly to schedule a personalized demo and discuss how Lextorah AI can support your school’s transformation goals.</p>
+            <p>We look forward to connecting with you.</p>
+            <p>Warm regards,</p>
+            <p><strong>Lextorah AI Team</strong><br>
+            🌐 <a href="https://www.lextorah.ai" style="color: #007bff; text-decoration: none;">www.lextorah.ai</a><br>
+            📧 <a href="mailto:info@lextorah.com" style="color: #007bff; text-decoration: none;">info@lextorah.com</a></p>
+        </div>
+        """
 
         await _send_email(
-            subject="We have received your Demo Request",
+            subject="Lextorah AI Demo Request Received",
             html_body=user_html,
             to_emails=[user_email]
         )

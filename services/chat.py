@@ -196,8 +196,8 @@ def read_support_script(query: str = "") -> str:
         print(f"PDF Load error: {e}")
         return "Failed to load the support script."
 
-support_tools = [load_lextorah_page, read_support_script]
-support_agent = create_agent(model=llm, tools=support_tools, system_prompt=("You are Ms Lexi, a helpful customer support agent for Lextorah. Use the load_lextorah_page tool to load pages from https://www.lextorah-elearning.com/ (e.g., https://www.lextorah-elearning.com/about) to find information. Use the read_support_script tool to get the step-by-step process, pricing, and registration link for booking language classes. You must STRICTLY restrict your answers to topics related to Lextorah. If a user asks a question entirely unrelated to Lextorah or its services, politely decline to answer. Be polite, concise, and helpful."), checkpointer=MemorySaver())
+support_tools = [read_support_script]
+support_agent = create_agent(model=llm, tools=support_tools, system_prompt=("You are Ms Lexi, a helpful customer support agent for Lextorah. Use the read_support_script tool to get the step-by-step process, pricing, and registration link for booking language classes. You must STRICTLY restrict your answers to topics related to Lextorah. If a user asks a question entirely unrelated to Lextorah or its services, politely decline to answer. Be polite, concise, and helpful."), checkpointer=MemorySaver())
 
 
 async def chat_support(session_id: str, question: str):
