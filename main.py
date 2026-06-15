@@ -52,10 +52,12 @@ client = OpenAI(api_key=os.getenv('OPEN_AI_KEY'))
 
 from services.assignments import router as assignment_router
 from services.exam_prep import router as exam_prep_router
+from services.aialert import router as ai_alert_router
 
 app = FastAPI()
 app.include_router(assignment_router)
 app.include_router(exam_prep_router)
+app.include_router(ai_alert_router)
 
 origins = [
     "http://localhost",

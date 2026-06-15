@@ -1,11 +1,12 @@
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query, Depends
 from typing import Optional
 from datetime import datetime
 import os
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from bson import ObjectId
 from utils.mongodb import assignments_collection, assignment_submissions_collection
 from services.cloudinary_client import uploadMaterialToCloudinary
+from utils.protected import decode_token, UserOutput
 
 router = APIRouter()
 
@@ -128,5 +129,89 @@ async def get_submissions(assignment_id: str):
             sub["_id"] = str(sub["_id"])
             
         return {"submissions": submissions}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class GradeSubmissionRequest(BaseModel):
+    score: float = Field(..., description="The score awarded to the student")
+    max_points: float = Field(100.0, description="The maximum mark defined by the tutor during grading")
+    feedback: Optional[str] = Field(None, description="Optional qualitative feedback from the tutor")
+    status: Optional[str] = Field("graded", description="The new status of the submission")
+
+@router.post("/api/submissions/{submission_id}/grade")
+async def grade_submission(
+    submission_id: str,
+    payload: GradeSubmissionRequest,
+    user: UserOutput = Depends(decode_token)
+):
+    try:
+        # 1. Validate submission ID format and fetch
+        try:
+            sub_id_obj = ObjectId(submission_id)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid submission ID format")
+
+        submission = await assignment_submissions_collection.find_one({"_id": sub_id_obj})
+        if not submission:
+            raise HTTPException(status_code=404, detail="Submission not found")
+
+        # 2. Validate and fetch associated assignment
+        assignment_id = submission.get("assignment_id")
+        try:
+            assignment_id_obj = ObjectId(assignment_id) if assignment_id else None
+        except Exception:
+            assignment_id_obj = None
+
+        if not assignment_id_obj:
+            raise HTTPException(status_code=404, detail="Submission has no valid assignment ID associated")
+
+        assignment = await assignments_collection.find_one({"_id": assignment_id_obj})
+        if not assignment:
+            raise HTTPException(status_code=404, detail="Associated assignment not found")
+
+        # 3. Verify user has Tutor/Admin role and owns/has access to the assignment
+        if user.role not in ("tutor", "admin"):
+            raise HTTPException(status_code=403, detail="Only tutors and admins are authorized to grade submissions.")
+
+        if user.role == "tutor":
+            if str(assignment.get("tutor_id")) != str(user.id):
+                raise HTTPException(status_code=403, detail="You do not have permission to grade this specific assignment.")
+
+        # 4. Validate score against maximum points provided in payload
+        max_points = payload.max_points
+        if payload.score < 0:
+            raise HTTPException(status_code=400, detail="Score cannot be negative.")
+        if payload.score > max_points:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Score {payload.score} exceeds the maximum allowed points of {max_points}."
+            )
+
+        # 5. Update submission row
+        update_doc = {
+            "score": payload.score,
+            "max_points": payload.max_points,
+            "feedback": payload.feedback,
+            "status": payload.status or "graded",
+            "graded_at": datetime.now()
+        }
+
+        await assignment_submissions_collection.update_one(
+            {"_id": sub_id_obj},
+            {"$set": update_doc}
+        )
+
+        return {
+            "message": "Submission graded successfully",
+            "submission_id": submission_id,
+            "score": payload.score,
+            "max_points": payload.max_points,
+            "feedback": payload.feedback,
+            "status": payload.status or "graded",
+            "graded_at": update_doc["graded_at"].isoformat()
+        }
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

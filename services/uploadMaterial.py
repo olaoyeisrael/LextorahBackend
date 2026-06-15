@@ -136,7 +136,6 @@ async def uploadMaterial(
             "course_title" : course_title,
             "topic": topic,
             "skill": skill,
-            "level": level,
             "filename": file.filename,
             "cloud_url": cloud_url,
             "content_type": file.content_type,
@@ -189,7 +188,6 @@ async def uploadMaterial(
                     "filename": file.filename,
                     "chunk_index": i,
                     "course": course_title,
-                    "level": level,
                     "topic": topic
                 }
             })
@@ -199,7 +197,7 @@ async def uploadMaterial(
         # filepath = os.path.join("materials", file.filename)
         # with open(filepath, "wb") as f:
         #     f.write(file.file.read())
-        return "File uploaded and indexed successfully"
+        return "File uploaded successfully"
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

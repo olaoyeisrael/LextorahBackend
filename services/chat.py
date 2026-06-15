@@ -87,16 +87,35 @@ async def chat_with_model(user_id: str, question: str):
     
     filter = None
     if user:
-         course = user.get("enrolled_course")
-         level = user.get("enrolled_level")
-         
-         if course and level:
-             filter = {
-                 "course": {"$eq": course},
-                 "level": {"$eq": level}
-             }
-         elif course:
-             filter = {"course": {"$eq": course}}
+        # Get list of enrolled course codes (supporting 'enrolled_courses', 'courses', or 'course_codes')
+        enrolled_codes = user.get("enrolled_courses") or user.get("courses") or user.get("course_codes") or []
+        
+        # Normalize to list
+        if isinstance(enrolled_codes, str):
+            enrolled_codes = [enrolled_codes]
+        elif not isinstance(enrolled_codes, list):
+            enrolled_codes = []
+            
+        # Fallback to single enrolled_course string if not already present
+        single_course = user.get("enrolled_course")
+        if single_course and single_course not in enrolled_codes:
+            enrolled_codes.append(single_course)
+            
+        # Clean up strings
+        enrolled_codes = [c.strip() for c in enrolled_codes if c and isinstance(c, str)]
+        
+        # Build Pinecone metadata filter based on course codes
+        if enrolled_codes:
+            if len(enrolled_codes) == 1:
+                filter = {
+                    "course": {"$eq": enrolled_codes[0]}
+                }
+            else:
+                filter = {
+                    "course": {"$in": enrolled_codes}
+                }
+        
+        print(f"DEBUG: retrieve_context filter for user '{user_id}' with enrolled course codes {enrolled_codes}: {filter}")
 
     
     context = retrieve_context(question, filter=filter)
