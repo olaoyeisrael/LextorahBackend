@@ -4,6 +4,7 @@ from services.model import ask_with_history
 from services.uploadMaterial import uploadMaterial
 import os 
 from PyPDF2 import PdfReader
+from utils.whisper import transcribe_audio
 
 
 class TeachRequest(BaseModel):
@@ -13,7 +14,43 @@ class TeachRequest(BaseModel):
 from typing import Union
 import io
 
-def extract_text_from_file(file_input: Union[str, io.BytesIO]):
+def extract_text_from_file(file_input: Union[str, io.BytesIO], filename: str = ""):
+    # Check if the input is an audio/video file based on extension
+    is_media = False
+    if isinstance(file_input, str):
+        if file_input.lower().endswith((".mp3", ".wav", ".mp4", ".mov", ".m4a", ".webm")):
+            is_media = True
+    elif filename:
+        if filename.lower().endswith((".mp3", ".wav", ".mp4", ".mov", ".m4a", ".webm")):
+            is_media = True
+
+    if is_media:
+        # If the input is a BytesIO stream, we must write it to a temporary file for Whisper
+        if isinstance(file_input, io.BytesIO):
+            import tempfile
+            ext = os.path.splitext(filename)[1] if filename else ".mp4"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
+                temp_file.write(file_input.getvalue())
+                temp_path = temp_file.name
+            try:
+                text = transcribe_audio(temp_path)
+            except Exception as e:
+                print(f"Whisper transcription failed: {e}")
+                text = ""
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+        else:
+            try:
+                text = transcribe_audio(file_input)
+            except Exception as e:
+                print(f"Whisper transcription failed: {e}")
+                text = ""
+        
+        if text:
+            return [{"title": "Transcript", "content": text}]
+        return []
+
     reader = PdfReader(file_input)
     sections = []
     for i, page in enumerate(reader.pages):

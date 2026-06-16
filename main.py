@@ -130,21 +130,28 @@ class MaterialUpload(BaseModel):
 
 # db = client["lextorah"]
 
-# --- Helper: Extract and Chunk ---
 def get_sections_for_user(user, mat):
-    # Logic from your WS: Download PDF if URL, or load local
+    # Try using pre-extracted text/transcript from database first
+    extracted_text = mat.get("extracted_text")
+    if extracted_text:
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+        chunks = splitter.split_text(extracted_text)
+        return [{"title": f"Part {i+1}", "content": chunk} for i, chunk in enumerate(chunks)]
+
+    # Fallback: Download file if URL, or load local
     raw_sections = []
     c_url = mat.get("cloud_url")
+    filename = mat.get("filename", "")
     if c_url:
         r = requests.get(c_url)
         pdf_stream = io.BytesIO(r.content)
-        raw_sections = extract_text_from_file(pdf_stream)
+        raw_sections = extract_text_from_file(pdf_stream, filename=filename)
     else:
         file_path = mat.get("file")
         if file_path:
             if not file_path.startswith("materials/"):
                 file_path = os.path.join("materials", os.path.basename(file_path))
-            raw_sections = extract_text_from_file(file_path)
+            raw_sections = extract_text_from_file(file_path, filename=filename or os.path.basename(file_path))
             
     if not raw_sections:
         return []
@@ -158,7 +165,6 @@ def get_sections_for_user(user, mat):
 async def stream_classroom_section(user_id: str, topic: str, sprint_id: int = None, section: int = None, course_code: str = None):
     # 1. Fetch User and Determine Sprint Topic
     user = await get_user(user_id)
-    
     sprint_course_code = None
     # Optional logic: If a topic wasn't provided, try resolving from sprint directly
     resolved_topic = topic
@@ -339,7 +345,14 @@ async def teach_ws(websocket: WebSocket, userid: str):
             })
             
             if mat:
-                if mat.get("cloud_url"):
+                extracted_text = mat.get("extracted_text")
+                filename = mat.get("filename", "") or (os.path.basename(mat.get("file")) if mat.get("file") else "")
+                if extracted_text:
+                    # Leverage pre-extracted text
+                    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+                    chunks = splitter.split_text(extracted_text)
+                    sections = [{"title": f"Section {i+1}", "content": chunk} for i, chunk in enumerate(chunks)]
+                elif mat.get("cloud_url"):
                     import requests
                     import io
                     c_url = mat.get("cloud_url")
@@ -363,8 +376,8 @@ async def teach_ws(websocket: WebSocket, userid: str):
                          await websocket.send_json({"error": "failed to download material"})
                          await websocket.close()
                          return
-                         
-                    sections = extract_text_from_file(pdf_stream)
+                          
+                    sections = extract_text_from_file(pdf_stream, filename=filename)
                     
                 elif mat.get("file"):
                     filename = os.path.basename(mat.get("file"))
@@ -401,7 +414,7 @@ async def teach_ws(websocket: WebSocket, userid: str):
                     await websocket.close()
                     return
             
-            sections = extract_text_from_file(pdf_stream)   
+            sections = extract_text_from_file(pdf_stream, filename=filename)   
 
         print(user)
         # ---- FIX: CORRECT start_section LOGIC ----
@@ -438,7 +451,7 @@ async def teach_ws(websocket: WebSocket, userid: str):
                 await websocket.close()
                 return
             
-            sections = extract_text_from_file(path)
+            sections = extract_text_from_file(path, filename=safe)
 
         # ---- UPDATE USER STARTING POSITION ----
         await user_collection.update_one(
@@ -649,11 +662,11 @@ async def quiz_endpoint(body: QuizRequest):
         
         if os.path.exists(path):
              # Extract text for quiz context
-             material_content = extract_text_from_file(path)
+             material_content = extract_text_from_file(path, filename=path)
     elif material_content and material_content.endswith(".pdf"):
         # Assume local if not http (though mostly will be http if from cloud)
         if os.path.exists(material_content):
-            material_content = extract_text_from_file(material_content)
+            material_content = extract_text_from_file(material_content, filename=material_content)
 
     
     # Check if at least material or topic is provided
@@ -1258,13 +1271,25 @@ async def get_progress(course_code: str, user: UserOutput = Depends(decode_token
     if not current_file:
          return {"progress": 0, "current_section": 0, "total_sections": 0, "course": f"{user.enrolled_course} {user.enrolled_level}", "completed_topics": completed_topics}
 
+    # Try to find the document in course_collection to get the extracted_text
+    extracted_text = None
+    from utils.mongodb import course_collection
+    mat = await course_collection.find_one({"filename": current_file})
+    if mat:
+        extracted_text = mat.get("extracted_text")
+
     # Get total sections for the file
-    path = os.path.join("materials", os.path.normpath(current_file))
-    if os.path.exists(path):
-        sections = extract_text_from_file(path)
-        total = len(sections)
+    if extracted_text:
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+        chunks = splitter.split_text(extracted_text)
+        total = len(chunks)
     else:
-        total = 1 # avoid div by zero
+        path = os.path.join("materials", os.path.normpath(current_file))
+        if os.path.exists(path):
+            sections = extract_text_from_file(path, filename=current_file)
+            total = len(sections)
+        else:
+            total = 1 # avoid div by zero
 
     progress = int((current_section / total) * 100) if total > 0 else 0
     print("Progress: ", progress)

@@ -27,7 +27,8 @@ index = pc.Index("lextorahdb")
 
 def extract_text_from_file(filepath: str, filename: str):
     text = ""
-    if filename.endswith(".pdf"):
+    filename_lower = filename.lower()
+    if filename_lower.endswith(".pdf"):
         reader = PdfReader(filepath)
         
         # 1. Extract all raw text from pages
@@ -80,10 +81,10 @@ def extract_text_from_file(filepath: str, filename: str):
                 print("Bulk Vision OCR completed successfully")
             except Exception as e:
                 print(f"Bulk Vision OCR failed for {filename}: {e}")
-
-    elif filename.endswith((".mp3", ".wav", ".mp4")):
+ 
+    elif filename_lower.endswith((".mp3", ".wav", ".mp4", ".mov", ".m4a", ".webm")):
         text = transcribe_audio(filepath)
-
+ 
     return text
 
 
@@ -100,8 +101,8 @@ async def uploadMaterial(
     import re
     # Check if topic and course code (course_title) already exist in DB to avoid duplicates
     existing = await course_collection.find_one({
-        "course_title": {"$regex": f"^{re.escape(course_title.strip())}$", "$options": "i"},
-        "topic": {"$regex": f"^{re.escape(topic.strip())}$", "$options": "i"}
+        "course_title": {"$regex": f"^\\s*{re.escape(course_title.strip())}\\s*$", "$options": "i"},
+        "topic": {"$regex": f"^\\s*{re.escape(topic.strip())}\\s*$", "$options": "i"}
     })
     if existing:
         raise HTTPException(
@@ -131,7 +132,10 @@ async def uploadMaterial(
         # but we already have `filepath`.
         cloud_url = uploadMaterialToCloudinary(filepath)
 
-        # 3. DB Entry
+        # 3. Extract text
+        text = extract_text_from_file(filepath, file.filename)
+
+        # 4. DB Entry
         course_doc = {
             "course_title" : course_title,
             "topic": topic,
@@ -139,7 +143,8 @@ async def uploadMaterial(
             "filename": file.filename,
             "cloud_url": cloud_url,
             "content_type": file.content_type,
-            "uploaded_at": datetime.now()
+            "uploaded_at": datetime.now(),
+            "extracted_text": text
         }
         
         # Upsert based on topic/level? Or just insert? User might overwrite.
@@ -167,8 +172,7 @@ async def uploadMaterial(
         except Exception as update_err:
             print(f"Failed to update curriculum item: {update_err}")
 
-        # 4. Extract & Vectorize
-        text = extract_text_from_file(filepath, file.filename)
+        # 5. Vectorize
         # print(f"====== EXTRACTED CONTENT START ({file.filename}) ======")
         # print(text)
         # print("====== EXTRACTED CONTENT END ======")
