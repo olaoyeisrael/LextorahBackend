@@ -2142,6 +2142,282 @@ async def delete_curriculum_item(id: str, user: UserOutput = Depends(decode_toke
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# --- ADMIN PROGRESS REPORT ENDPOINTS ---
+from utils.mongodb import reports_collection, quiz_results_collection
+from services.pdf_generator import create_pdf_from_text
+
+class ReportRequest(BaseModel):
+    from_date: str
+    to_date: str
+    class_code: str
+
+@app.post("/api/reports/generate")
+async def generate_report(body: ReportRequest, user: UserOutput = Depends(decode_token)):
+    if user.role not in ("admin", "tutor"):
+        raise HTTPException(status_code=403, detail="Admins and tutors only")
+
+    import re
+    from datetime import datetime
+    from utils.mongodb import user_collection, quiz_results_collection
+
+    # 1. Parse date parameters
+    try:
+        start_dt = datetime.strptime(body.from_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(body.to_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Expected YYYY-MM-DD")
+
+    # 2. Retrieve all students
+    students_cursor = user_collection.find({"role": "student"})
+    all_students = await students_cursor.to_list(length=1000)
+
+    report_rows = []
+    class_code_upper = body.class_code.strip().upper() if body.class_code else "ALL CLASSES"
+
+    for student in all_students:
+        s_id = student.get("_id")
+        s_first = student.get("first_name") or student.get("firstName") or ""
+        s_last = student.get("last_name") or student.get("lastName") or ""
+        s_name = f"{s_first} {s_last}".strip() or student.get("email") or "Unknown Student"
+        
+        # Course Enrolled
+        s_course = student.get("enrolled_course") or "General"
+        s_course_cap = s_course.capitalize()
+        
+        # Fetch all quizzes for this student to determine Level Started and Current Level
+        student_quizzes_cursor = quiz_results_collection.find({"user_id": s_id}).sort("date", 1)
+        student_quizzes = await student_quizzes_cursor.to_list(length=1000)
+        
+        # Level Started
+        level_started = "A1"
+        if student_quizzes:
+            level_started = student_quizzes[0].get("level") or "A1"
+        elif student.get("enrolled_level"):
+            level_started = student.get("enrolled_level")
+            
+        # Current Level
+        current_level = student.get("enrolled_level") or (student_quizzes[-1].get("level") if student_quizzes else "A1")
+        
+        # Quizzes in filtered date range
+        period_quizzes = [q for q in student_quizzes if start_dt <= q.get("date", q.get("created_at")) <= end_dt]
+        
+        # Filter student by class_code if a specific class is selected
+        if class_code_upper != "ALL CLASSES":
+            # Check if student has quizzes for this course code
+            has_quiz_for_class = any((q.get("course_code") or "").upper().strip() == class_code_upper for q in student_quizzes)
+            
+            # Check if enrolled course/level matches prefix/level of class_code
+            parts = class_code_upper.split('/')
+            prefix = parts[0] if len(parts) > 0 else ""
+            level = parts[1] if len(parts) > 1 else ""
+            from utils.courseData import SUBJECT_MAPPING
+            subject_name = SUBJECT_MAPPING.get(prefix, "").upper()
+            
+            matches_enrollment = False
+            s_course_upper = s_course.upper()
+            s_level_upper = (student.get("enrolled_level") or "").upper()
+            if (s_course_upper == prefix or s_course_upper == subject_name) and s_level_upper == level:
+                matches_enrollment = True
+                
+            if not has_quiz_for_class and not matches_enrollment:
+                continue
+                
+        # Overall Assessment Score in the period
+        if period_quizzes:
+            percentages = []
+            for q in period_quizzes:
+                score = q.get("score", 0)
+                total = q.get("total", 0)
+                pct = q.get("score_percent")
+                if pct is None:
+                    pct = (score / total * 100) if total > 0 else 0
+                percentages.append(pct)
+            avg_score_pct = sum(percentages) / len(percentages)
+            overall_score_str = f"{avg_score_pct:.0f}%"
+        else:
+            avg_score_pct = None
+            overall_score_str = ""
+            
+        # Progress Status
+        completed_topics_count = 0
+        progress_dict = student.get("progress", {})
+        for course_k, progress_v in progress_dict.items():
+            completed_topics_count += len(progress_v.get("completed_topics", []))
+            
+        if completed_topics_count > 0:
+            status = "on-going"
+        elif period_quizzes or student_quizzes:
+            status = "on-going"
+        else:
+            status = "Just started"
+            
+        # Notes (Dropouts, Issues)
+        if avg_score_pct is not None:
+            if avg_score_pct < 50:
+                notes = "Needs improvement"
+            elif avg_score_pct >= 75:
+                notes = "Improving"
+            else:
+                notes = "Improving"
+        else:
+            notes = ""
+            
+        report_rows.append({
+            "name": s_name,
+            "course": s_course_cap,
+            "level_started": level_started,
+            "current_level": current_level if status == "on-going" else "",
+            "overall_score": overall_score_str,
+            "status": status,
+            "notes": notes
+        })
+
+    # 3. Format Tutor's Name & Date
+    tutor_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or "Mark Neboh"
+    current_date = datetime.now().strftime("%d-%m-%y")
+
+    # 4. Build Markdown Content containing the dynamic grid table
+    markdown_content = f"""# STUDENT PROGRESS TRACKER
+**Tutor's Name**: {tutor_name}
+**Date**: {current_date}
+
+| Student Name | Course Enrolled | Level Started | Current Level | Overall Assessment Scores (%) | Progress Status | Notes (Dropouts, Issues) |
+| --- | --- | --- | --- | --- | --- | --- |
+"""
+    for row in report_rows:
+        markdown_content += f"| {row['name']} | {row['course']} | {row['level_started']} | {row['current_level']} | {row['overall_score']} | {row['status']} | {row['notes']} |\n"
+
+    # 5. Save Report to Database
+    report_type = "Performance"
+    if "risk" in body.class_code.lower() or "alert" in body.class_code.lower():
+        report_type = "Risk"
+    elif "activity" in body.class_code.lower():
+        report_type = "Activity"
+    elif "material" in body.class_code.lower():
+        report_type = "Materials"
+
+    title = f"Student Progress Tracker - {body.class_code}" if body.class_code != "All Classes" else "Student Progress Tracker"
+    
+    report_doc = {
+        "title": title,
+        "type": report_type,
+        "from_date": body.from_date,
+        "to_date": body.to_date,
+        "class_code": body.class_code,
+        "content": markdown_content.strip(),
+        "created_at": datetime.now()
+    }
+
+    inserted = await reports_collection.insert_one(report_doc)
+    report_id = str(inserted.inserted_id)
+
+    return {
+        "id": report_id,
+        "title": title,
+        "type": report_type,
+        "from_date": body.from_date,
+        "to_date": body.to_date,
+        "class_code": body.class_code,
+        "created_at": report_doc["created_at"].isoformat()
+    }
+
+@app.get("/api/reports")
+async def get_reports(user: UserOutput = Depends(decode_token)):
+    if user.role not in ("admin", "tutor"):
+        raise HTTPException(status_code=403, detail="Admins and tutors only")
+
+    cursor = reports_collection.find().sort("created_at", -1)
+    reports = await cursor.to_list(length=100)
+
+    formatted_reports = []
+    for r in reports:
+        formatted_reports.append({
+            "id": str(r["_id"]),
+            "title": r.get("title", "Report"),
+            "type": r.get("type", "Performance"),
+            "from_date": r.get("from_date"),
+            "to_date": r.get("to_date"),
+            "class_code": r.get("class_code"),
+            "created_at": r["created_at"].isoformat() if isinstance(r.get("created_at"), datetime) else str(r.get("created_at"))
+        })
+
+    return formatted_reports
+
+@app.get("/api/reports/download/{report_id}")
+async def download_report(report_id: str, user: UserOutput = Depends(decode_token)):
+    if user.role not in ("admin", "tutor"):
+        raise HTTPException(status_code=403, detail="Admins and tutors only")
+
+    from bson import ObjectId
+    try:
+        report = await reports_collection.find_one({"_id": ObjectId(report_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid ID")
+
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    content = report.get("content", "")
+    title = report.get("title", "report").replace(" ", "_").lower()
+    pdf_bytes = create_pdf_from_text(content, f"{title}.pdf")
+
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{title}_{report_id}.pdf"'}
+    )
+
+
+# --- ADMIN COURSE CREATION ENDPOINT ---
+class AddCourseRequest(BaseModel):
+    title: str
+    code: str
+    category: str
+    level: str
+    duration: str | None = None
+    maxCapacity: str | None = None
+    description: str | None = None
+
+@app.post("/api/courses")
+async def add_course_endpoint(body: AddCourseRequest, user: UserOutput = Depends(decode_token)):
+    if user.role not in ("admin", "tutor"):
+        raise HTTPException(status_code=403, detail="Admins and tutors only")
+
+    from utils.mongodb import courses_list_collection
+    
+    # Check if course_code already exists
+    existing = await courses_list_collection.find_one({"course_code": body.code.strip()})
+    if existing:
+        raise HTTPException(status_code=400, detail=f"Course with code '{body.code}' already exists.")
+
+    new_course = {
+        "course_code": body.code.strip(),
+        "course_name": f"{body.category.strip()} ({body.level.strip()})" if body.category.strip() else body.title.strip(),
+        "level": body.level.strip(),
+        "category": body.category.strip(),
+        "title": body.title.strip(),
+        "duration": body.duration.strip() if body.duration else None,
+        "max_capacity": body.maxCapacity.strip() if body.maxCapacity else None,
+        "description": body.description.strip() if body.description else None,
+        "created_at": datetime.now()
+    }
+    
+    await courses_list_collection.insert_one(new_course)
+    return {"msg": "Course created successfully"}
+
+
+@app.get("/api/courses")
+async def get_courses_endpoint(user: UserOutput = Depends(decode_token)):
+    if user.role not in ("admin", "tutor"):
+        raise HTTPException(status_code=403, detail="Admins and tutors only")
+
+    from utils.mongodb import courses_list_collection
+    cursor = courses_list_collection.find({})
+    courses = await cursor.to_list(length=1000)
+    
+    return [c.get("course_code") for c in courses if c.get("course_code")]
+
+
 
 
 
