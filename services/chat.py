@@ -20,7 +20,17 @@ llm = ChatOpenAI(
 )
 
 prompt = ChatPromptTemplate.from_messages([
-    SystemMessagePromptTemplate.from_template("You are Ms Lexi, a helpful assistant. Use the context below to answer the user's question."),
+    SystemMessagePromptTemplate.from_template(
+        "You are Ms Lexi, a helpful AI tutor who uses the Socratic method to guide students.\n"
+        "Your goal is to help the user discover the correct answer on their own through questioning and reasoning, rather than giving the answer away directly.\n"
+        "Guidelines:\n"
+        "1. Never give a direct answer, full summary, or direct solution to the user's questions.\n"
+        "2. Carefully read the provided Context to understand the facts, but do not state the context or repeat facts directly to the student.\n"
+        "3. Instead, ask guiding, thought-provoking, and open-ended questions that prompt the student to think critically and take the next step.\n"
+        "4. Break down complex concepts into small, manageable parts. Focus on one step/concept at a time.\n"
+        "5. Validate the user's correct reasoning and gently guide them back when they make a mistake by asking a clarifying or simpler question.\n"
+        "6. Always keep your response concise, polite, and educational."
+    ),
     MessagesPlaceholder(variable_name="history_messages"),
     HumanMessagePromptTemplate.from_template("Question: {question}\nContext:\n{context}"),
 ])
@@ -186,20 +196,48 @@ from langchain_community.document_loaders import WebBaseLoader, PyPDFLoader
 from langchain_core.tools import tool
 
 @tool
-def load_lextorah_page(url: str) -> str:
-    """Load a specific page from the lextorah-elearning.com website to find answers to customer support queries."""
+def load_web_page(url: str) -> str:
+    """Load and read a specific page from Lextorah or partner websites to find answers to customer support queries.
+    Allowed websites/domains: www.homeworks.ng, www.lextorah-elearning.com, www.lextorah.com, www.lextorahsolutions.com.ng, www.lextorahjobs.com, www.Lextorah.aI
+    """
     try:
-        if "lextorah-elearning.com" not in url:
-             return "Please only load URLs from lextorah-elearning.com."
-             
+        # Prepend scheme if missing
+        if not url.startswith("http://") and not url.startswith("https://"):
+            url = "https://" + url
+
+        # Normalize the URL for domain check
+        url_lower = url.lower()
+        allowed_domains = [
+            "homeworks.ng",
+            "lextorah-elearning.com",
+            "lextorah.com",
+            "lextorahsolutions.com.ng",
+            "lextorahjobs.com",
+            "lextorah.ai"
+        ]
+        
+        # Check if the URL domain is allowed
+        from urllib.parse import urlparse
+        parsed_url = urlparse(url)
+        hostname = parsed_url.hostname or ""
+        
+        is_allowed = False
+        for domain in allowed_domains:
+            if hostname == domain or hostname.endswith("." + domain):
+                is_allowed = True
+                break
+                
+        if not is_allowed:
+            return f"Please only load URLs from the allowed domains: {', '.join(allowed_domains)}."
+            
         loader = WebBaseLoader(url)
         docs = loader.load()
         content = docs[0].page_content if docs else ""
-        print(f"Loaded content from {url}: {content[:200]}...")  # Log the first 200 characters for debugging
+        print(f"Loaded content from {url}: {content[:200]}...")  # Log first 200 characters for debugging
         return content[:4000]
     except Exception as e:
         print(f"Load error: {e}")
-        return "Failed to load the web page."
+        return f"Failed to load the web page: {e}"
 
 
 
@@ -215,8 +253,8 @@ def read_support_script(query: str = "") -> str:
         print(f"PDF Load error: {e}")
         return "Failed to load the support script."
 
-support_tools = [read_support_script]
-support_agent = create_agent(model=llm, tools=support_tools, system_prompt=("You are Ms Lexi, a helpful customer support agent for Lextorah. Use the read_support_script tool to get the step-by-step process, pricing, and registration link for booking language classes. You must STRICTLY restrict your answers to topics related to Lextorah. If a user asks a question entirely unrelated to Lextorah or its services, politely decline to answer. Be polite, concise, and helpful."), checkpointer=MemorySaver())
+support_tools = [read_support_script, load_web_page]
+support_agent = create_agent(model=llm, tools=support_tools, system_prompt=("You are Ms Lexi, a helpful customer support agent for Lextorah. Use the read_support_script tool to get step-by-step processes and booking info from the local PDF script, and use the load_web_page tool to fetch content from Lextorah and partner sites: www.homeworks.ng, www.lextorah-elearning.com, www.lextorah.com, www.lextorahsolutions.com.ng, www.lextorahjobs.com, and www.Lextorah.aI. You must STRICTLY restrict your answers to topics related to Lextorah, its partner sites, and their services. If a user asks a question entirely unrelated, politely decline to answer. Be polite, concise, and helpful."), checkpointer=MemorySaver())
 
 
 async def chat_support(session_id: str, question: str):
