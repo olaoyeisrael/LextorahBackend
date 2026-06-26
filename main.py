@@ -161,8 +161,17 @@ def get_sections_for_user(user, mat):
     chunks = splitter.split_text(full_text)
     
     return [{"title": f"Part {i+1}", "content": chunk} for i, chunk in enumerate(chunks)]
+
+
 @app.get("/classroom/next/{user_id}")
-async def stream_classroom_section(user_id: str, topic: str, sprint_id: int = None, section: int = None, course_code: str = None):
+async def stream_classroom_section(
+    user_id: str,
+    topic: str,
+    sprint_id: int = None,
+    section: int = None,
+    course_code: str = None,
+    trigger_quiz: bool = False
+):
     # 1. Fetch User and Determine Sprint Topic
     user = await get_user(user_id)
     sprint_course_code = None
@@ -185,6 +194,11 @@ async def stream_classroom_section(user_id: str, topic: str, sprint_id: int = No
     actual_course_code = course_code or sprint_course_code
     
     sections = []
+    is_video = False
+    video_url = ""
+    transcript_text = ""
+    mats = []
+    
     for single_topic in topics_list:
         safe_topic = re.escape(single_topic) # Escape "()", "+", etc. so $regex works purely as a string match
         
@@ -199,11 +213,27 @@ async def stream_classroom_section(user_id: str, topic: str, sprint_id: int = No
         print(f"DEBUG DB QUERY: {mat_query}")
             
         mat_cursor = course_collection.find(mat_query)
-        mats = await mat_cursor.to_list(length=1)
-        if mats:
-            # Extract and immediately append to our master sections list
-            mat_sections = get_sections_for_user(user, mats[0])
+        found_mats = await mat_cursor.to_list(length=1)
+        if found_mats:
+            mat = found_mats[0]
+            mats.append(mat)
+            
+            c_type = mat.get("content_type", "") or ""
+            c_url = mat.get("cloud_url", "") or ""
+            fname = mat.get("filename", "") or ""
+            
+            # Check if this material is a video
+            if "video" in c_type or "/video/upload/" in c_url or fname.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm')):
+                is_video = True
+                video_url = c_url
+                transcript_text = mat.get("extracted_text", "")
+            
+            mat_sections = get_sections_for_user(user, mat)
             sections.extend(mat_sections)
+
+    if not sections and is_video:
+        # Fallback if no sections extracted but we have a video
+        sections = [{"title": "Video Transcript", "content": transcript_text or "No transcript available for this video."}]
 
     if not sections:
         raise HTTPException(status_code=404, detail=f"No material found for topics: {resolved_topic}")
@@ -215,7 +245,10 @@ async def stream_classroom_section(user_id: str, topic: str, sprint_id: int = No
     
     should_update_db = False
 
-    if section is not None:
+    if trigger_quiz:
+        idx = len(sections) + 1
+        should_update_db = True
+    elif section is not None:
         # User explicitly requested a jump
         idx = section
         should_update_db = True
@@ -230,28 +263,68 @@ async def stream_classroom_section(user_id: str, topic: str, sprint_id: int = No
             {"$set": {"classroom_topic": topic, "current_section": idx}}
         )
     
-    print(f"DEBUG: topic={topic}, user current_section={idx}, len(sections)={len(sections)}, requested_section={section}")
+    print(f"DEBUG: topic={topic}, user current_section={idx}, len(sections)={len(sections)}, requested_section={section}, trigger_quiz={trigger_quiz}, is_video={is_video}")
 
-    # 3. Check if Lesson is Finished -> Trigger Quiz
-    if idx > len(sections):
-        async def trigger_quiz():
+    # 3. Check if Lesson is Finished or trigger_quiz is requested -> Trigger Quiz
+    if trigger_quiz or idx > len(sections):
+        async def trigger_quiz_stream():
             # Combine all content to generate quiz (like your WS logic)
             full_content = "\n\n".join([s["content"] for s in sections])
+            if not full_content and transcript_text:
+                full_content = transcript_text
             quiz_data = await asyncio.to_thread(generate_quiz, full_content)
             yield f"data: {json.dumps({'type': 'quiz', 'data': quiz_data})}\n\n"
         
-        return StreamingResponse(trigger_quiz(), media_type="text/event-stream")
+        return StreamingResponse(trigger_quiz_stream(), media_type="text/event-stream")
 
     # 4. Get Current Section
     section = sections[idx - 1]
     
-    # 5. Increment progress in DB for the next call
+    # 5. If it's a video, stream video metadata and transcript immediately, then stop
+    if is_video:
+        async def stream_video_content():
+            syllabus_data = [{"title": s["title"], "index": i + 1} for i, s in enumerate(sections)]
+            yield f"data: {json.dumps({'type': 'syllabus', 'sections': syllabus_data})}\n\n"
+            yield f"data: {json.dumps({'type': 'info', 'section_index': idx})}\n\n"
+            yield f"data: {json.dumps({'type': 'video', 'video_url': video_url, 'transcript': transcript_text})}\n\n"
+            
+            # ---> Auto Save Transcript <---
+            from utils.mongodb import db
+            existing_transcript = await db.transcripts.find_one({
+                "user_id": user_id, 
+                "topic": topic,
+                "course": user.get('enrolled_course', ''),
+                "level": user.get('enrolled_level', '')
+            })
+            
+            if transcript_text:
+                if not existing_transcript:
+                    await db.transcripts.insert_one({
+                        "user_id": user_id,
+                        "topic": topic,
+                        "course": user.get('enrolled_course', ''),
+                        "level": user.get('enrolled_level', ''),
+                        "course_code": sprint_course_code,
+                        "content": transcript_text,
+                        "date": datetime.now()
+                    })
+                else:
+                    await db.transcripts.update_one(
+                        {"_id": existing_transcript["_id"]},
+                        {"$set": {"content": transcript_text, "date": datetime.now()}}
+                    )
+            
+            yield "data: [DONE]\n\n"
+        
+        return StreamingResponse(stream_video_content(), media_type="text/event-stream")
+
+    # 6. Increment progress in DB for the next call (only for non-video standard lessons)
     await user_collection.update_one(
         {"_id": user_id},
         {"$set": {"current_section": idx + 1}}
     )
 
-    # 6. Stream the Explanation Using LangGraph Agent
+    # 7. Stream the Explanation Using LangGraph Agent (for standard lessons)
     async def generate_explanation():
         # First yield the metadata needed for Learn.jsx navigation UI
         syllabus_data = [{"title": s["title"], "index": i + 1} for i, s in enumerate(sections)]
@@ -299,14 +372,6 @@ async def stream_classroom_section(user_id: str, topic: str, sprint_id: int = No
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate_explanation(), media_type="text/event-stream")
-
-
-
-
-
-
-
-
 
 
 @app.websocket("/ws/teach/{userid}")
@@ -2416,6 +2481,192 @@ async def get_courses_endpoint(user: UserOutput = Depends(decode_token)):
     courses = await cursor.to_list(length=1000)
     
     return [c.get("course_code") for c in courses if c.get("course_code")]
+
+
+class SprintScheduleItem(BaseModel):
+    day_of_week: str
+    start_time: str
+    end_time: str
+    mode: str | None = "Online"
+
+class CreateSprintRequest(BaseModel):
+    course_code: str
+    name: str
+    start_date: str
+    end_date: str
+    duration_weeks: int
+    tutor_id: str
+    schedules: list[SprintScheduleItem]
+
+class AssignStudentRequest(BaseModel):
+    student_id: str
+
+@app.get("/api/admin/users")
+async def get_admin_users(role: str | None = None, user: UserOutput = Depends(decode_token)):
+    if user.role not in ("admin", "tutor"):
+        raise HTTPException(status_code=403, detail="Admins and tutors only")
+
+    from utils.mongodb import user_collection
+    query = {}
+    if role:
+        query["role"] = role
+    
+    cursor = user_collection.find(query)
+    users = await cursor.to_list(length=1000)
+    
+    return [
+        {
+            "id": str(u.get("_id")),
+            "email": u.get("email"),
+            "first_name": u.get("first_name") or u.get("firstName") or "",
+            "last_name": u.get("last_name") or u.get("lastName") or "",
+            "role": u.get("role")
+        }
+        for u in users
+    ]
+
+@app.post("/api/sprints")
+async def create_sprint_endpoint(body: CreateSprintRequest, user: UserOutput = Depends(decode_token)):
+    if user.role not in ("admin", "tutor"):
+        raise HTTPException(status_code=403, detail="Admins and tutors only")
+
+    from utils.mongodb import sprints_collection
+    import random
+
+    cursor = sprints_collection.find({})
+    sprints = await cursor.to_list(length=1000)
+    
+    max_id = 0
+    for s in sprints:
+        try:
+            sid_val = int(s.get("sprint_id", 0))
+            if sid_val > max_id:
+                max_id = sid_val
+        except ValueError:
+            pass
+
+    new_sprint_id = str(max_id + 1) if max_id > 0 else str(random.randint(100, 999))
+
+    new_sprint = {
+        "sprint_id": new_sprint_id,
+        "course_code": body.course_code,
+        "name": body.name,
+        "start_date": body.start_date,
+        "end_date": body.end_date,
+        "duration_weeks": body.duration_weeks,
+        "tutor_id": str(body.tutor_id),
+        "schedules": [sch.dict() for sch in body.schedules],
+        "students": [],
+        "syllabus": [],
+        "created_at": datetime.now()
+    }
+
+    await sprints_collection.insert_one(new_sprint)
+    return {"msg": "Sprint cohort created successfully", "sprint_id": new_sprint_id}
+
+@app.get("/api/sprints")
+async def get_sprints_endpoint(user: UserOutput = Depends(decode_token)):
+    if user.role not in ("admin", "tutor"):
+        raise HTTPException(status_code=403, detail="Admins and tutors only")
+
+    from utils.mongodb import sprints_collection
+    cursor = sprints_collection.find({})
+    sprints = await cursor.to_list(length=1000)
+    
+    result = []
+    for s in sprints:
+        s["_id"] = str(s["_id"])
+        if "created_at" in s and isinstance(s["created_at"], datetime):
+            s["created_at"] = s["created_at"].isoformat()
+        if "updated_at" in s and isinstance(s["updated_at"], datetime):
+            s["updated_at"] = s["updated_at"].isoformat()
+        result.append(s)
+
+    return result
+
+@app.post("/api/sprints/{sprint_id}/assign")
+async def assign_student_endpoint(sprint_id: str, body: AssignStudentRequest, user: UserOutput = Depends(decode_token)):
+    if user.role not in ("admin", "tutor"):
+        raise HTTPException(status_code=403, detail="Admins and tutors only")
+
+    from utils.mongodb import sprints_collection, user_collection, courses_list_collection
+    
+    student = await user_collection.find_one({"_id": str(body.student_id)})
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found in database")
+    
+    sprint = await sprints_collection.find_one({"sprint_id": str(sprint_id)})
+    if not sprint:
+        raise HTTPException(status_code=404, detail="Sprint not found in database")
+    
+    student_first = student.get("first_name") or student.get("firstName") or ""
+    student_last = student.get("last_name") or student.get("lastName") or ""
+    student_name = f"{student_first} {student_last}".strip() or student.get("email")
+
+    student_entry = {
+        "id": str(body.student_id),
+        "name": student_name,
+        "email": student.get("email")
+    }
+    
+    await sprints_collection.update_one(
+        {"sprint_id": str(sprint_id)},
+        {"$addToSet": {"students": student_entry}}
+    )
+
+    course = await courses_list_collection.find_one({"course_code": sprint.get("course_code")})
+    course_title = course.get("title") if course else sprint.get("course_code")
+    course_level = course.get("level") if course else "General"
+
+    sprint_entry = {
+        "id": str(sprint_id),
+        "course_code": sprint.get("course_code"),
+        "name": sprint.get("name")
+    }
+
+    await user_collection.update_one(
+        {"_id": str(body.student_id)},
+        {
+            "$addToSet": {"sprints": sprint_entry},
+            "$set": {
+                "enrolled_course": (course_title or "").lower(),
+                "enrolled_level": (course_level or "").lower()
+            }
+        }
+    )
+
+    return {"msg": f"Student assigned successfully to cohort '{sprint.get('name')}'"}
+
+@app.get("/api/user/sprints")
+async def get_user_sprints(user: UserOutput = Depends(decode_token)):
+    from utils.mongodb import sprints_collection
+
+    sprints_cursor = sprints_collection.find({})
+    all_sprints = await sprints_cursor.to_list(length=1000)
+
+    managed_sprints = []
+    student_sprints = []
+
+    for s in all_sprints:
+        s["_id"] = str(s["_id"])
+        if "created_at" in s and isinstance(s["created_at"], datetime):
+            s["created_at"] = s["created_at"].isoformat()
+        if "updated_at" in s and isinstance(s["updated_at"], datetime):
+            s["updated_at"] = s["updated_at"].isoformat()
+
+        if s.get("tutor_id") == str(user.id):
+            managed_sprints.append(s)
+            
+        students_list = s.get("students") or []
+        for std in students_list:
+            if str(std.get("id")) == str(user.id):
+                student_sprints.append(s)
+                break
+
+    return {
+        "managed_sprints": managed_sprints,
+        "student_sprints": student_sprints
+    }
 
 
 
