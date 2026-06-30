@@ -1475,11 +1475,12 @@ class LiveClass(BaseModel):
     meeting_link: str
     recording_link: str | None = None
     tutor: str | None = None 
+    course_code: str | None = None
 
 @app.post("/live_class")
 async def schedule_live_class(cls: LiveClass, user: UserOutput = Depends(decode_token)):
-    if user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admins only")
+    if user.role not in ["admin", "tutor"]:
+        raise HTTPException(status_code=403, detail="Admins and Tutors only")
     
     from utils.mongodb import live_classes_collection
     
@@ -1487,6 +1488,8 @@ async def schedule_live_class(cls: LiveClass, user: UserOutput = Depends(decode_
     data = cls.dict()
     data["course"] = data["course"].lower()
     data["level"] = data["level"].lower()
+    if data.get("course_code"):
+        data["course_code"] = data["course_code"].upper()
     data["created_at"] = datetime.now()
     
     # Insert
@@ -1494,12 +1497,15 @@ async def schedule_live_class(cls: LiveClass, user: UserOutput = Depends(decode_
     return {"msg": "Class scheduled", "id": str(res.inserted_id)}
 
 @app.get("/live_classes")
-async def get_live_classes(course: str = None, level: str = None):
+async def get_live_classes(course: str = None, level: str = None, course_code: str = None):
     from utils.mongodb import live_classes_collection
     
     query = {}
-    if course: query["course"] = {"$regex": f"^{course}$", "$options": "i"}
-    if level: query["level"] = {"$regex": f"^{level}$", "$options": "i"}
+    if course_code:
+        query["course_code"] = {"$regex": f"^{re.escape(course_code)}$", "$options": "i"}
+    else:
+        if course: query["course"] = {"$regex": f"^{course}$", "$options": "i"}
+        if level: query["level"] = {"$regex": f"^{level}$", "$options": "i"}
     print("Live Class Update Data: ", live_classes_collection)
     
     cursor = live_classes_collection.find(query).sort("date", 1)
@@ -1514,8 +1520,8 @@ async def get_live_classes(course: str = None, level: str = None):
 
 @app.put("/live_class/{class_id}")
 async def update_live_class(class_id: str, update_data: dict, user: UserOutput = Depends(decode_token)):
-    if user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admins only")
+    if user.role not in ["admin", "tutor"]:
+        raise HTTPException(status_code=403, detail="Admins and Tutors only")
         
     from utils.mongodb import live_classes_collection
     from bson import ObjectId
@@ -2178,6 +2184,8 @@ async def get_course_structure(user: UserOutput = Depends(decode_token)):
 
 @app.delete('/live_class/{id}')
 async def delete_live_class(id: str, user: UserOutput = Depends(decode_token)):
+    if user.role not in ["admin", "tutor"]:
+        raise HTTPException(status_code=403, detail="Admins and Tutors only")
     from utils.mongodb import live_classes_collection
     from bson.objectid import ObjectId
     
